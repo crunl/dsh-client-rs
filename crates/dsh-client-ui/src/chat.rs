@@ -2440,6 +2440,10 @@ impl Chat {
                             .items_center()
                             .gap_1()
                             .pt(px(6.))
+                            .text_size(px(theme::META))
+                            // 左端：权限 mode 下拉（从 statusline 挪进来的，
+                            // 与上方输入文字同一条左沿）。
+                            .child(self.mode_chip(cx))
                             .child(div().flex_1())
                             .child(self.primary_button(cx)),
                     ),
@@ -2998,16 +3002,29 @@ impl Chat {
             .flex_row()
             .items_center()
             .justify_between()
+            .gap_4()
             .py(px(4.))
             .text_size(px(theme::META))
             .text_color(rgb(theme::INK_SOFT))
-            .child(self.mode_chip(cx))
+            // 左端是当前工作区（不是可点控件）：
+            // 它回答「这台会话在哪个目录里干活」，与右侧那排读数分开。
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .min_w(px(0.))
+                    .max_w(px(280.))
+                    .text_color(rgb(theme::INK_MUTED))
+                    .child(div().min_w(px(0.)).truncate().child(self.workspace.clone())),
+            )
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_3()
+                    .flex_none()
                     .child(self.model_chip(cx))
                     // 官方：模型没有推理元数据时隐藏强度文案，不显示「effort —」。
                     .children(

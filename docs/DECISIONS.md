@@ -1991,3 +1991,25 @@ magpie dsh default              # 把 magpie 从 dsh 里摘出去
 代价是默认模型跟着 magpie 走（当前 `remote-magpie/group/ds-4.1-flash`）。
 想回到官方 `deepseek-official / deepseek-flash` 而不和 magpie 抢这个文件：
 `magpie dsh default` + 在 UI 里点一次官方模型（host 会自己写 `agent-default-model`）。
+
+## #50 mode 下拉从 statusline 挪进输入卡片的按钮行
+
+**日期**：2026-11
+
+**决策**：`mode`（权限 preset 下拉）不再站在 statusline 左端，改成输入卡片里的
+按钮行左侧（`输入框下面那行：workspace-write ⌄ ……… ↑`），
+那一行右端仍是 send / stop。statusline 左端改放**当前工作区名**（只读文本，
+`INK_MUTED`、超 280pt 截断），右侧仍是 `model` · `effort` · ctx 环 · cache，
+整行 `justify_between` 贴着内容列两端。
+
+**为什么**：`mode` 是「这一轮怎么执行」的开关，与发送动作同属一次提交；把它贴到
+发送按钮那一行，视线不用在输入框和下面那行之间来回跳。另外 statusline 因此少一个
+可点控件，左侧留白让右侧读数更像「仪表」而不是工具条。
+
+**位置细节**：芯片文字左沿与输入文字同一条线（卡片内边距 12，芯片自身无 padding），
+行高由 24pt 的圆形按钮撑开；字号沿用 `META` 11，颜色 `INK_SOFT`、hover/展开时 `INK`。
+`pull_menu` 的弹出方向不用改——它在触发器上方 26pt 打开，落到输入区之上，
+卡片没有 `overflow_hidden`，不会被裁掉；z 序上 chips 行在卡片之后绘制，但两者不重叠。
+
+**代价**：与官方 desktop 的 composer 摆法不同（官方在 statusline 左端）。
+这是有意的偏离，按 #47/#48 的同一口径：位置跟操作距离走，不跟设计稿逐像素走。

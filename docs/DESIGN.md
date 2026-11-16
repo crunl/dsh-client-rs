@@ -51,7 +51,7 @@
 │  ├─ 项目分组侧栏（会话树）                          │
 │  ├─ 流式 timeline（消息 / 工具调用 / UiBlock）      │
 │  ├─ 交互层（审批弹窗 / user question / 输入框）     │
-│  └─ composer 控制条（mode / model / effort / ctx）  │
+│  └─ composer 控制条（model / effort / ctx 读数）     │
 │  协议客户端 crate                                   │
 │  └─ dsh-protocol ←── 唯一了解 wire 细节的 crate     │
 └──────────┬────────────────────────────────────────┘
@@ -177,14 +177,15 @@ dsh-client-rs 通用渲染器（Rust）
 
 ## composer 控制条（statusline）
 
-输入区下方独立一行（布局见 Ardot 设计稿）：左端 `mode` 下拉，右端
-`model` | `effort` | ctx 圆环（32px 环形进度）。
+输入区下方独立一行：左端是**当前工作区名**（`INK_MUTED`、超过 280pt 截断、不可点），
+右端是 `model` | `effort` | ctx 圆环（32px 环形进度）| cache。
+`mode` 下拉不在这一行——它在输入卡片的按钮行左侧（#50），那行右端是 send / stop。
 
 数据绑定（wire 结构与语义见 PROTOCOL.md「statusline（composer 控制条）数据源」）：
 
 | 位 | 源 | 说明 |
 | --- | --- | --- |
-| mode | 投影 `permissions` + `permissionPresets/catalog` | 服务端有状态；**键缺失 = 未组合权限服务，隐藏控件** |
+| mode | 投影 `permissions` + `permissionPresets/catalog` | 服务端有状态；**键缺失 = 未组合权限服务，隐藏控件**。控件位置在输入卡片里，菜单从芯片向上开 |
 | model | `session/modelCatalog` + 投影 `modelSelection` | 目录驱动下拉，当前值来自会话投影 |
 | effort | catalog 条目 `reasoning.efforts` | 不透明 ID，精确匹配，禁止自动降级/别名 |
 | ctx 圆环 | 投影 `contextPressure` / `tokenUsage` | `session/projections` 快照 + `session/follow` 增量 |
