@@ -1,0 +1,26 @@
+[package]
+name = "dsh-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "dsh host process lifecycle: spawn, handshake, protocol transport"
+
+[dependencies]
+dsh-protocol.workspace = true
+
+tokio.workspace = true
+reqwest.workspace = true
+url.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+
+uuid.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

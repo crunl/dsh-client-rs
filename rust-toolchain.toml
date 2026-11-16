@@ -1,0 +1,10 @@
+[toolchain]
+# channel = "stable" 而不是钉死版本号：rustup 的 `stable` 与 `1.100.0` 是两个独立
+# 安装目录，钉版本号会让每台机器为同一份 bits 再下载一次。
+#
+# 下限由依赖决定，不是偏好：
+# - gpui-pre-util 0.3.12 使用 `slice::as_array`，该特性在 1.93.0 稳定
+#   （rust-lang/rust#133508，milestone 1.93.0）。1.90 会报 E0658。
+# - Linux 目标的 oo7（经 ashpd）要求 >= 1.92。
+channel = "stable"
+components = ["rustfmt", "clippy"]

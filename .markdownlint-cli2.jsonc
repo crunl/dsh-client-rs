@@ -1,0 +1,12 @@
+// dsh-client-rs 文档 lint 口径（markdownlint-cli2）。
+// 中文字符占双列宽，80 列默认值对 CJK 表格文档过严：
+// - MD013 行长放宽至 200 列，表格不检查（表格单元格无法折行）；
+// 其余规则保持 markdownlint 默认。
+{
+  "config": {
+    "MD013": {
+      "line_length": 200,
+      "tables": false
+    }
+  }
+}

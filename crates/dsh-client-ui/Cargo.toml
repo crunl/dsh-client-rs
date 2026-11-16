@@ -1,0 +1,24 @@
+[package]
+name = "dsh-client-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "dsh-client-rs GPUI surfaces"
+
+[dependencies]
+dsh-protocol.workspace = true
+gpui-kit.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[features]
+# 控件库仍不启用（+12MB，DECISIONS #20）；资源包单开实测 0MB 级，图标是 Lucide。
+default = ["assets"]
+# 控件库。会连带拉入 gpui-kit-assets（依赖不可拆）。缺原语时再开。
+component = ["gpui-kit/component"]
+# gpui-kit 内置的图标/字体资源包。
+assets = ["gpui-kit/assets"]
+
+[lints]
+workspace = true

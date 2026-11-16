@@ -1,0 +1,74 @@
+[workspace]
+members = [
+    "crates/dsh-protocol",
+    "crates/dsh-host",
+    "crates/dsh-client-ui",
+    "apps/desktop",
+]
+default-members = ["apps/desktop"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+publish = false
+
+[workspace.dependencies]
+# 内部 crate。依赖方向：apps/desktop → dsh-client-ui → dsh-protocol ← dsh-host
+dsh-protocol = { path = "crates/dsh-protocol" }
+dsh-host = { path = "crates/dsh-host" }
+dsh-client-ui = { path = "crates/dsh-client-ui" }
+
+# ── UI ────────────────────────────────────────────────────────────────────
+# gpui-kit 是 GPUI 的唯一入口：它把 gpui-pre 家族（=0.3.12，zed@d2a4fb6 快照）
+# 一起钉住。不要再单独依赖 crates.io 上的 `gpui`，那是另一条谱系。
+# 不依赖 gpui-shell（见 DECISIONS #6）。
+# 默认这里关掉 features：控件库（component）与图标资产（assets）由各 crate 显式
+# 开启，好让「关掉它们能省多少内存」成为可测的开关而不是信念。
+gpui-kit = { version = "0.9.1", default-features = false }
+
+# ── 序列化 ────────────────────────────────────────────────────────────────
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ── 错误与日志 ────────────────────────────────────────────────────────────
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ── 异步运行时与传输 ──────────────────────────────────────────────────────
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "io-util",
+    "sync",
+    "time",
+    "net",
+    "fs",
+] }
+reqwest = { version = "0.13", default-features = false, features = ["cookies", "json"] }
+url = "2"
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
+
+# ── 标识 ──────────────────────────────────────────────────────────────────
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[profile.release]
+# 桌面应用按二进制体积与冷启动优化；north star 是运行时 RAM，不是构建时间。
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.probe]
+# 内存基线测量专用：继承 release 的优化级别，但不做 LTO、多 codegen unit，
+# 让「改一行 → 重新量一次」从分钟级降到秒级。LTO 与 codegen-units 影响代码布局，
+# 对常驻 RSS 的影响在 ±几 MB，不影响量级判断。
+inherits = "release"
+lto = false
+codegen-units = 16
