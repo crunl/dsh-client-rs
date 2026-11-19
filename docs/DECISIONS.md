@@ -528,6 +528,7 @@ bundle。`dsh-client-modules` 的机制是「宿主半侧扫描已启用的 Load
 
 > 后续修正：版本钉死、数据版本护栏与「不污染用户环境」继续有效；
 > 具体打包形态改为 #52 的独立 runtime package。legacy 布局仅作兼容回退。
+> 当前实际钉版为 `0.2.2-rc.5`（2026-11-19 升级）；本节的 rc.3 分析是首次打包时的历史依据。
 
 **决策**：客户端**自带**固定版本的 Node 运行时与 dsh（含完整生产依赖树），
 打包进 app bundle 的 `Resources/runtime/`。**不**从 PATH 查找 dsh，
@@ -2104,6 +2105,21 @@ app                   → ensure runtime → spawn bin/cowork-host → 接 ready
 - `plain` 首次启动需要网络；离线用户应使用 `embedded`。
 - 当前 launcher 仍是 shell `exec`，ready URL 继续从 host 输出中识别；把 ready 行收进 launcher
   是后续独立优化，不影响本决策的 runtime 边界。
+
+**当前打包基线（2026-11-19）**：
+
+```text
+dsh          = 0.2.2-rc.5
+node         = 24.20.0
+runtime id   = dsh-0.2.2-rc.5+node-24.20.0+darwin-arm64
+sha256       = a6ef9f43e48d9317f799a95b244530be05f7fd58034f64de6047156ef98da218
+archive size = 345,334,176 bytes
+```
+
+rc.3 的 manifest 与 archive 保留在 `runtime-build/rollback/rc3/`，用于回滚。升级前先在隔离
+`COWORK_HOME` / `DSH_HOME` 完成冷启动与 smoke：`probe`、`model`、`workspaces`、`follow`，
+并确认 `tool/call` 与 `tool/result` 均落盘。此轮未做依赖裁剪，体积仍约 329MB 压缩、
+1.5GB 展开。
 
 ## #53 host 生命周期：supervisor 单一发布状态
 
