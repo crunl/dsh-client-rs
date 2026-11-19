@@ -2140,3 +2140,39 @@ UI 只做投影。两个布尔会允许非法组合，也会把「还没收到�
 
 `UiEvent::Failed` 继续承载具体错误文案，但不再代表 host 生命周期；普通命令失败不改变状态。
 侧栏文案一一映射：`host 启动中` / `dsh host` / `host 休眠中` / `host 启动失败`。
+
+## #54 runtime code profile：保守裁剪，不删功能
+
+**日期**：2026-11-19
+
+**决策**：`package-runtime.py` 增加 `--profile full|code`。`full` 是默认且字节不变；
+`code` 只套用官方 Desktop 对已安装生产 npm 树的保守排除规则。裁剪包的 id 后缀 `+code`，
+manifest 与 `runtime.json` 记录 `profile` 和逐类排除计数，避免与 full runtime 混用同一目录。
+
+**排除范围**：
+
+- package manager metadata；source map；TypeScript 声明与 build cache。
+- 非目标 LibreOfficeKit engine；`fs-ext` 编译器输出与构建配置。
+- Domino test / `.yarn`；node-pty Windows ConPTY 源码、非目标 prebuild、`.pdb`。
+- Koffi 的 Windows import library。
+
+官方规则保留目标 native 二进制、许可证和所有无法识别的资源。因此这一轮**不删除**
+Office / WASM / 语音等大包：它们是 Harness 功能，不属于 build/diagnostic/off-platform 文件。
+Node 自带 npm 的声明文件也不在 dsh npm 树的规则范围内。
+
+**实测**：
+
+| profile | archive | 压缩 | 展开 |
+| --- | --- | --- | --- |
+| `full` | `a6ef9f43…da218` | 345,334,176 B（329M） | 约 1.5G |
+| `code` | `ca1329f0…ce9` | 254,025,459 B（257M） | 约 1.1G |
+
+`code` 包排除 25,494 个声明、9,947 个 source map、非目标 LibreOffice/WASM 和
+node-pty 文件，压缩体积减少约 91MB。full 包重生成后 hash 与已安装的 `/Applications` 一致，
+说明新增 profile 没有改变既有产物。
+
+**验证**：`tests/test_package_runtime.py` 覆盖每类排除、未知资源保留、目标 engine 选择与
+id 校验；`scripts/runtime/smoke-runtime.sh` 跑 `probe` / `model` / `workspaces` / `follow`。
+code 包还做了隔离冷启动（`Starting → Ready`）、真实工具调用（`tool/call` → `tool/result`）
+和一次正常文本 prompt。正式 app 未替换为 code 包；后续如需切换，使用
+`COWORK_RUNTIME_PACKAGE_DIR=runtime-build/code ./scripts/build-product.sh`。
