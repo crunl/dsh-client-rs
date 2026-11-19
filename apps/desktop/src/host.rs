@@ -12,24 +12,28 @@
 //! 状态层（会话/工作区/凭据）在 `$DSH_HOME` 级共享，运行时层（进程/profile/peer）
 //! 独占：dsh web 在跑也各起各的，端口由 OS 分配互不相撞。
 //!
-//! 运行时位置按下面顺序找（先打包形态、后开发形态）：
+//! 运行时位置按下面顺序找（先新架构、后兼容路径）：
 //!
 //! ```text
-//! $COWORK_RUNTIME
-//! cowork.app/Contents/Resources/runtime      ← 打包产物
-//! <exe 所在目录>/runtime                      ← target/release/runtime
-//! .runtime-staging                            ← 仓库里的开发期运行时
+//! $COWORK_RUNTIME                             显式目录（开发/排障）
+//! Resources/runtime-manifest.json             runtime package 清单
+//!   ├─ Resources/<archive>                    内嵌离线包
+//!   ├─ $COWORK_RUNTIME_URL                    在线下载
+//!   └─ ~/.cowork/runtimes/<id>/               安装后的不可变 runtime
+//! Resources/runtime                           legacy 内置完整 node_modules
+//! .runtime-staging                            仓库里的开发期运行时
 //! ```
 //!
-//! `node` 不打包（Node 是 launcher + `libnode.dylib` + 一堆 Homebrew dylib，
-//! 拷进来要重写 rpath），改为构建时把绝对路径写进 `Resources/node-path.txt`，
-//! 运行时按「$COWORK_NODE → node-path.txt → 常见绝对路径 → PATH」找。
+//! runtime package 对外只暴露 `bin/cowork-host`：它自己知道 Node 和 dsh 入口。
+//! legacy 路径仍保留，避免旧版 app 和新版构建脚本互相打断。
 
-use std::io::{BufRead, BufReader};
+use serde::Deserialize;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// 产品的 dsh profile 名。会话、工作区、认证都在这个 profile 下。
 pub const PROFILE: &str = "cowork";
@@ -40,8 +44,44 @@ const SEED_PROFILE: &str = "web";
 /// 等 ready URL 的上限。冷启动要跑 cordis 装配 + 插件加载，20s 内都算正常。
 const READY_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// `bin.js` 相对运行时目录的位置。
+/// `bin.js` 相对 legacy runtime 目录的位置。
 const BIN_PATH: &str = "node_modules/@deepseek-ai/dsh/lib/bin.js";
+
+/// app bundle 内的 runtime package 清单。
+const RUNTIME_MANIFEST: &str = "runtime-manifest.json";
+
+#[derive(Debug, Clone, Deserialize)]
+struct RuntimeManifest {
+    schema: u32,
+    id: String,
+    target: String,
+    archive: String,
+    sha256: String,
+    size: u64,
+    launcher: String,
+    url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstalledRuntime {
+    schema: u32,
+    id: String,
+}
+
+/// 最终启动命令的来源。新 runtime 包只暴露 launcher；legacy 仍直接拼 node 参数。
+enum HostLaunch {
+    Runtime { dir: PathBuf, launcher: PathBuf },
+    Legacy { runtime: PathBuf, node: PathBuf },
+}
+
+impl HostLaunch {
+    fn display_path(&self) -> &Path {
+        match self {
+            Self::Runtime { dir, .. } => dir,
+            Self::Legacy { runtime, .. } => runtime,
+        }
+    }
+}
 
 /// 拉起后的 host 子进程。drop 即杀。
 pub struct HostProcess {
@@ -96,8 +136,7 @@ pub fn start() -> Result<Startup, String> {
     }
 
     let home = dsh_home();
-    let runtime = locate_runtime()?;
-    let node = locate_node(&runtime);
+    let launch = resolve_host_launch()?;
     let profile = std::env::var("COWORK_PROFILE").unwrap_or_else(|_| PROFILE.to_owned());
     let seeded = home
         .join("profiles")
@@ -114,11 +153,14 @@ pub fn start() -> Result<Startup, String> {
     //
     // 不钉 `--max-old-space-size`：能再省 ≈8MB，但重度会话（长上下文、大文件）
     // 真撞上限就是 OOM 崩宿主，不值。
-    let mut host_args = vec![
-        node.display().to_string(),
-        "--max-semi-space-size=4".to_owned(),
-        runtime.join(BIN_PATH).display().to_string(),
-    ];
+    let mut host_args = match &launch {
+        HostLaunch::Runtime { launcher, .. } => vec![launcher.display().to_string()],
+        HostLaunch::Legacy { runtime, node } => vec![
+            node.display().to_string(),
+            "--max-semi-space-size=4".to_owned(),
+            runtime.join(BIN_PATH).display().to_string(),
+        ],
+    };
     host_args.push("--profile".to_owned());
     host_args.push(profile.clone());
     if !seeded {
@@ -151,8 +193,7 @@ pub fn start() -> Result<Startup, String> {
         .stderr(Stdio::piped());
 
     tracing::info!(
-        node = %node.display(),
-        runtime = %runtime.display(),
+        runtime = %launch.display_path().display(),
         profile = %profile,
         seeded,
         home = %home.display(),
@@ -161,7 +202,7 @@ pub fn start() -> Result<Startup, String> {
 
     let mut child = command
         .spawn()
-        .map_err(|error| format!("启动 {} 失败: {error}", node.display()))?;
+        .map_err(|error| format!("启动 host 失败: {error}"))?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
@@ -337,43 +378,367 @@ fn dsh_home() -> PathBuf {
     PathBuf::from(user).join(".dsh")
 }
 
-/// 运行时目录（含 `node_modules/@deepseek-ai/dsh/lib/bin.js` 的那一层）。
-fn locate_runtime() -> Result<PathBuf, String> {
-    let mut tried: Vec<PathBuf> = Vec::new();
-    for candidate in runtime_candidates() {
-        if candidate.join(BIN_PATH).exists() {
-            return Ok(candidate);
-        }
-        tried.push(candidate);
+/// 解析最终启动方式：新 runtime package 优先，legacy 路径兜底。
+fn resolve_host_launch() -> Result<HostLaunch, String> {
+    if let Ok(explicit) = std::env::var("COWORK_RUNTIME") {
+        let dir = PathBuf::from(explicit);
+        return legacy_or_package(&dir);
     }
-    let list = tried
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join("\n  ");
+
+    if let Some(resources) = resources_dir() {
+        let manifest_path = resources.join(RUNTIME_MANIFEST);
+        if manifest_path.is_file() {
+            let manifest = read_runtime_manifest(&manifest_path)?;
+            if manifest.target != target_triple() {
+                return Err(format!(
+                    "runtime package 目标不匹配：需要 {}，清单是 {}",
+                    target_triple(),
+                    manifest.target
+                ));
+            }
+            let dir = ensure_runtime_installed(&manifest, &resources)?;
+            let launcher = dir.join(&manifest.launcher);
+            if !launcher.is_file() {
+                return Err(format!("runtime 缺少 launcher：{}", launcher.display()));
+            }
+            return Ok(HostLaunch::Runtime { dir, launcher });
+        }
+
+        let bundled = resources.join("runtime");
+        if bundled.join(BIN_PATH).is_file() {
+            let node = locate_node(&bundled);
+            return Ok(HostLaunch::Legacy {
+                runtime: bundled,
+                node,
+            });
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        let staging = cwd.join(".runtime-staging");
+        if staging.join(BIN_PATH).is_file() {
+            let node = locate_node(&staging);
+            return Ok(HostLaunch::Legacy {
+                runtime: staging,
+                node,
+            });
+        }
+    }
+
     Err(format!(
-        "找不到 dsh 运行时（要含 {BIN_PATH}）。找过：\n  {list}\n用 COWORK_RUNTIME 指过去，或者先跑一次打包脚本。"
+        "找不到 dsh runtime。请设置 COWORK_RUNTIME，或在 app 中放入 {RUNTIME_MANIFEST} / legacy runtime。"
     ))
 }
 
-fn runtime_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(explicit) = std::env::var("COWORK_RUNTIME") {
-        candidates.push(PathBuf::from(explicit));
+fn legacy_or_package(dir: &Path) -> Result<HostLaunch, String> {
+    let launcher = dir.join("bin/cowork-host");
+    if launcher.is_file() {
+        return Ok(HostLaunch::Runtime {
+            dir: dir.to_path_buf(),
+            launcher,
+        });
     }
-    // 打包形态：Contents/MacOS/cowork → Contents/Resources/runtime
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(macos) = exe.parent()
-        && let Some(contents) = macos.parent()
+    if dir.join(BIN_PATH).is_file() {
+        return Ok(HostLaunch::Legacy {
+            runtime: dir.to_path_buf(),
+            node: locate_node(dir),
+        });
+    }
+    Err(format!(
+        "COWORK_RUNTIME 指向的目录既没有 bin/cowork-host，也没有 {BIN_PATH}：{}",
+        dir.display()
+    ))
+}
+
+fn resources_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let macos = exe.parent()?;
+    let contents = macos.parent()?;
+    Some(contents.join("Resources"))
+}
+
+fn read_runtime_manifest(path: &Path) -> Result<RuntimeManifest, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("读取 {} 失败: {error}", path.display()))?;
+    let manifest: RuntimeManifest = serde_json::from_str(&text)
+        .map_err(|error| format!("解析 {} 失败: {error}", path.display()))?;
+    if manifest.schema != 1 {
+        return Err(format!(
+            "不支持的 runtime manifest schema: {}",
+            manifest.schema
+        ));
+    }
+    if manifest.id.is_empty()
+        || manifest.id.contains('/')
+        || manifest.id.contains("\\")
+        || manifest.id.contains("..")
     {
-        candidates.push(contents.join("Resources").join("runtime"));
-        candidates.push(macos.join("runtime"));
+        return Err(format!("非法 runtime id: {}", manifest.id));
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join(".runtime-staging"));
-        candidates.push(cwd.join("runtime"));
+    if manifest.archive.contains('/') || manifest.archive.contains("\\") {
+        return Err(format!("非法 runtime archive: {}", manifest.archive));
     }
-    candidates
+    if manifest.launcher.contains("..") || manifest.launcher.starts_with('/') {
+        return Err(format!("非法 runtime launcher: {}", manifest.launcher));
+    }
+    Ok(manifest)
+}
+
+fn target_triple() -> &'static str {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        "darwin-arm64"
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        "darwin-x64"
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        "linux-x64"
+    }
+    #[cfg(not(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )))]
+    {
+        "unsupported"
+    }
+}
+
+fn runtime_install_root() -> PathBuf {
+    let home = std::env::var("COWORK_HOME")
+        .unwrap_or_else(|_| std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned()));
+    PathBuf::from(home).join(".cowork").join("runtimes")
+}
+
+fn ensure_runtime_installed(
+    manifest: &RuntimeManifest,
+    resources: &Path,
+) -> Result<PathBuf, String> {
+    let root = runtime_install_root();
+    fs::create_dir_all(&root).map_err(|error| format!("创建 {} 失败: {error}", root.display()))?;
+    let final_dir = root.join(&manifest.id);
+    if installed_runtime_matches(&final_dir, manifest) {
+        return Ok(final_dir);
+    }
+    if final_dir.exists() {
+        let bad = root.join(format!("{}.bad-{}", manifest.id, unix_nanos()));
+        fs::rename(&final_dir, &bad)
+            .map_err(|error| format!("隔离损坏 runtime {} 失败: {error}", final_dir.display()))?;
+    }
+
+    let lock_path = root.join(format!(".{}.lock", manifest.id));
+    let lock = acquire_install_lock(&lock_path)?;
+    clean_stale_install_dirs(&root, &manifest.id)?;
+
+    let result = install_runtime(manifest, resources, &root, &final_dir);
+    drop(lock);
+    let _ = fs::remove_file(&lock_path);
+    result
+}
+
+fn open_install_lock(path: &Path) -> std::io::Result<fs::File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
+fn acquire_install_lock(path: &Path) -> Result<fs::File, String> {
+    let describe = |error: &std::io::Error| {
+        format!(
+            "无法获取 runtime 安装锁 {}（另一个安装正在进行？）: {error}",
+            path.display()
+        )
+    };
+
+    let mut file = match open_install_lock(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            let pid = fs::read_to_string(path)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok());
+            if let Some(pid) = pid
+                && pid > 0
+                && process_alive(pid)
+            {
+                return Err(format!(
+                    "runtime 安装锁被进程 {pid} 持有：{}",
+                    path.display()
+                ));
+            }
+            let _ = fs::remove_file(path);
+            open_install_lock(path).map_err(|error| describe(&error))?
+        }
+        Err(error) => return Err(describe(&error)),
+    };
+
+    let _ = writeln!(file, "{}", std::process::id());
+    let _ = file.sync_all();
+    Ok(file)
+}
+
+fn clean_stale_install_dirs(root: &Path, id: &str) -> Result<(), String> {
+    let prefix = format!(".{id}-");
+    let entries = fs::read_dir(root).map_err(|error| format!("读取 runtime 目录失败: {error}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("读取 runtime 目录项失败: {error}"))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&prefix) && name.ends_with(".install") && entry.path().is_dir() {
+            fs::remove_dir_all(entry.path()).map_err(|error| {
+                format!(
+                    "清理未完成 runtime 安装目录 {} 失败: {error}",
+                    entry.path().display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn process_alive(pid: i32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn install_runtime(
+    manifest: &RuntimeManifest,
+    resources: &Path,
+    root: &Path,
+    final_dir: &Path,
+) -> Result<PathBuf, String> {
+    let embedded = resources.join(&manifest.archive);
+    let is_downloaded = !embedded.is_file();
+    let env_url = std::env::var("COWORK_RUNTIME_URL").ok();
+    let download_url = env_url
+        .as_deref()
+        .filter(|url| !url.is_empty())
+        .or_else(|| manifest.url.as_deref().filter(|url| !url.is_empty()));
+    let archive = if !is_downloaded {
+        embedded
+    } else if let Some(url) = download_url {
+        let downloaded = root.join(format!(".{}-{}.download", manifest.id, unix_nanos()));
+        download_runtime(url, &downloaded)?;
+        downloaded
+    } else {
+        return Err(format!(
+            "runtime 包缺失，且清单没有下载 URL：{}",
+            embedded.display()
+        ));
+    };
+
+    let verified = (|| -> Result<(), String> {
+        let size = fs::metadata(&archive)
+            .map_err(|error| format!("读取 runtime 包大小失败: {error}"))?
+            .len();
+        if size != manifest.size {
+            return Err(format!(
+                "runtime 包大小不匹配：期望 {}，实际 {size}",
+                manifest.size
+            ));
+        }
+        let digest = sha256_file(&archive)?;
+        if !digest.eq_ignore_ascii_case(&manifest.sha256) {
+            return Err(format!(
+                "runtime 包 SHA-256 不匹配：期望 {}，实际 {digest}",
+                manifest.sha256
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = verified {
+        if is_downloaded {
+            let _ = fs::remove_file(&archive);
+        }
+        return Err(error);
+    }
+
+    let temp_dir = root.join(format!(".{}-{}.install", manifest.id, unix_nanos()));
+    let installed = (|| -> Result<(), String> {
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir)
+            .map_err(|error| format!("创建临时 runtime 目录失败: {error}"))?;
+        let status = Command::new("tar")
+            .arg("-xzf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&temp_dir)
+            .status()
+            .map_err(|error| format!("解压 runtime 包失败: {error}"))?;
+        if !status.success() {
+            return Err(format!("tar 解压 runtime 包失败: {status}"));
+        }
+        if !installed_runtime_matches(&temp_dir, manifest) {
+            return Err("runtime 包内容缺失或 runtime.json 不匹配".to_owned());
+        }
+        fs::rename(&temp_dir, final_dir)
+            .map_err(|error| format!("安装 runtime 到 {} 失败: {error}", final_dir.display()))
+    })();
+    let _ = fs::remove_dir_all(&temp_dir);
+    if is_downloaded {
+        let _ = fs::remove_file(&archive);
+    }
+    installed.map(|()| final_dir.to_path_buf())
+}
+
+fn download_runtime(url: &str, dest: &Path) -> Result<(), String> {
+    let status = Command::new("curl")
+        .arg("-fL")
+        .arg("--retry")
+        .arg("2")
+        .arg("-o")
+        .arg(dest)
+        .arg(url)
+        .status()
+        .map_err(|error| format!("下载 runtime 失败: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        let _ = fs::remove_file(dest);
+        Err(format!("curl 下载 runtime 失败: {status}"))
+    }
+}
+
+fn installed_runtime_matches(dir: &Path, manifest: &RuntimeManifest) -> bool {
+    let Ok(text) = fs::read_to_string(dir.join("runtime.json")) else {
+        return false;
+    };
+    let Ok(spec) = serde_json::from_str::<InstalledRuntime>(&text) else {
+        return false;
+    };
+    spec.schema == 1 && spec.id == manifest.id && dir.join(&manifest.launcher).is_file()
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let output = Command::new("shasum")
+        .arg("-a")
+        .arg("256")
+        .arg(path)
+        .output()
+        .map_err(|error| format!("计算 SHA-256 失败: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "shasum 失败: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.split_whitespace()
+        .next()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| "shasum 输出为空".to_owned())
+}
+
+fn unix_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
 }
 
 /// node 可执行文件。GUI 启动的 app 拿不到 shell 的 PATH，所以绝对路径优先。
@@ -410,7 +775,9 @@ fn locate_node(runtime: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::redact_token;
+    use super::{read_runtime_manifest, redact_token, sha256_file, target_triple};
+    use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn redact_token_hides_the_value_but_keeps_the_shape() {
@@ -424,5 +791,61 @@ mod tests {
             "url=http://x/?token=***&y=2 tail"
         );
         assert_eq!(redact_token("no credentials here"), "no credentials here");
+    }
+
+    #[test]
+    fn runtime_manifest_is_parsed_and_validated() {
+        let json = r#"{
+            "schema": 1,
+            "id": "dsh-0.2.2-rc.3+node-24.20.0+darwin-arm64",
+            "target": "darwin-arm64",
+            "archive": "runtime.coworkrt.tar.gz",
+            "sha256": "deadbeef",
+            "size": 42,
+            "launcher": "bin/cowork-host",
+            "url": ""
+        }"#;
+        let path =
+            std::env::temp_dir().join(format!("cowork-manifest-{}.json", std::process::id()));
+        fs::write(&path, json).unwrap();
+        let manifest = read_runtime_manifest(&path).unwrap();
+        assert_eq!(manifest.id, "dsh-0.2.2-rc.3+node-24.20.0+darwin-arm64");
+        assert_eq!(manifest.launcher, "bin/cowork-host");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn runtime_manifest_rejects_path_traversal() {
+        let json = r#"{
+            "schema": 1,
+            "id": "../escape",
+            "target": "darwin-arm64",
+            "archive": "runtime.tar.gz",
+            "sha256": "deadbeef",
+            "size": 42,
+            "launcher": "bin/cowork-host"
+        }"#;
+        let path =
+            std::env::temp_dir().join(format!("cowork-bad-manifest-{}.json", std::process::id()));
+        fs::write(&path, json).unwrap();
+        assert!(read_runtime_manifest(&path).is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn sha256_file_matches_known_digest() {
+        let path: PathBuf =
+            std::env::temp_dir().join(format!("cowork-sha256-{}.txt", std::process::id()));
+        fs::write(&path, "hello\n").unwrap();
+        assert_eq!(
+            sha256_file(&path).unwrap(),
+            "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn target_triple_is_not_empty() {
+        assert!(!target_triple().is_empty());
     }
 }

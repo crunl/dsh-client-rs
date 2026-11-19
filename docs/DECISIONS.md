@@ -526,6 +526,9 @@ bundle。`dsh-client-modules` 的机制是「宿主半侧扫描已启用的 Load
 
 **日期**：2026-11
 
+> 后续修正：版本钉死、数据版本护栏与「不污染用户环境」继续有效；
+> 具体打包形态改为 #52 的独立 runtime package。legacy 布局仅作兼容回退。
+
 **决策**：客户端**自带**固定版本的 Node 运行时与 dsh（含完整生产依赖树），
 打包进 app bundle 的 `Resources/runtime/`。**不**从 PATH 查找 dsh，
 **不**在运行期安装或升级，**不**写用户全局 npm。环境变量可指向 PATH 上的
@@ -2048,3 +2051,56 @@ state.set_auto_grow(1, 6, cx);   // 1 行起，长到 6 行，再高就卡片内
 
 **调试**：`DSH_DEBUG_KEYS` 白名单加了 `shift-enter`（原先只有 up/down/enter/tab/escape/shift-tab），
 这个开关跑起来时 `send` 仍自动进测试模式，不会真投递。
+
+## #52 runtime package：app 与运行时解耦
+
+**日期**：2026-11
+
+**决策**：dsh runtime 不再以 loose `Resources/runtime/node_modules` 的形式属于 app 体积。
+它被打包成一个不可变的 `.coworkrt.tar.gz`：里面有固定版本 Node、dsh 生产依赖树、
+`runtime.json` 和唯一入口 `bin/cowork-host`。app 只带 `runtime-manifest.json`，
+按清单校验 hash 后安装到 `~/.cowork/runtimes/<id>/`，再启动 launcher。
+
+**为什么**：
+
+- 当前全量依赖树是 1.3GB，占 app 体积的 93%；继续塞进 app 只会把 Node 再加 90MB。
+- 官方 Desktop 用 Electron 兼作 Node runtime；我们是原生 GPUI 客户端，没有 Electron UI 可复用，
+  为 runtime 单独塞 Electron 不划算。
+- app 版本与 harness runtime 版本的变更频率不同，应该能分别升级；#18 的版本钉死通过 manifest 保留。
+- 用户状态在 `~/.dsh`，runtime 是可替换缓存；两者不能混在一个目录里。
+
+**入口契约**：
+
+```text
+runtime-manifest.json → id/target/archive/sha256/size/launcher/url
+runtime package       → runtime.json + bin/cowork-host + node/ + dsh/
+app                   → ensure runtime → spawn bin/cowork-host → 接 ready URL
+```
+
+`bin/cowork-host` 自己知道 Node 与 dsh 入口，app 不再拼 `node bin.js ...`。
+`COWORK_RUNTIME_URL` 可以覆盖在线下载地址；内嵌 archive 优先于下载。
+
+**发行形态**：
+
+| 模式 | app 内容 | 行为 |
+| --- | --- | --- |
+| `legacy` | 完整 `Resources/runtime` | 兼容旧构建；默认保留直到 runtime package 正式发布 |
+| `embedded` | manifest + archive | 离线双击即用，首次启动安装到用户目录 |
+| `plain` | 仅 manifest + URL | app 最小，首次启动下载 runtime |
+
+**硬规则**：
+
+- manifest 的 `target` 必须等于当前平台，否则拒绝启动。
+- id 与 archive/launcher 路径受限，防止 manifest 越界写文件。
+- 安装前校验 archive size 与 SHA-256；安装后校验 `runtime.json` 的 schema/id。
+- 已安装 runtime 有唯一目录；损坏目录先改名隔离，不原地覆盖。
+- 安装锁带 PID：活进程持锁时拒绝并发安装；崩溃留下的陈旧锁和未完成 `.install` 目录可回收。
+- 不自动删除旧版本 runtime；回滚和清理由后续版本管理负责。
+
+**代价**：
+
+- 第一版仍未做依赖裁剪，runtime package 初期可能接近当前 1.3GB；本决策先把边界和校验做对。
+- `embedded` 安装包仍包含压缩 runtime，只是 app 壳本身回到十 MB 量级。
+- `plain` 首次启动需要网络；离线用户应使用 `embedded`。
+- 当前 launcher 仍是 shell `exec`，ready URL 继续从 host 输出中识别；把 ready 行收进 launcher
+  是后续独立优化，不影响本决策的 runtime 边界。

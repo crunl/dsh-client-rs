@@ -4,11 +4,13 @@
 # 开发期临时运行时（`npm install --prefix .runtime-staging`，见 docs/DESIGN.md）
 /.runtime-staging/
 
-# 产品产物（`./scripts/build-product.sh` 生成，1.4G，可重建）
+# 产品产物与 runtime package（`./scripts/build-product.sh` 可重建）
 /cowork/
+/runtime-build/
 
 # 本地调试产物
 *.log
+__pycache__/
 
 # macOS
 .DS_Store

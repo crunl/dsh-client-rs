@@ -62,6 +62,22 @@
 └───────────────────────────────────────────────────┘
 ```
 
+## runtime package 边界
+
+dsh runtime 是独立 sidecar，不再算 app 壳的体积（#52）。构建期由
+`scripts/runtime/package-runtime.py` 产出不可变 archive：固定 Node、dsh 生产依赖树、
+`runtime.json` 与唯一入口 `bin/cowork-host`。app 只带 `runtime-manifest.json`，
+启动前校验 archive hash，安装到 `~/.cowork/runtimes/<id>/`，再启动 launcher。
+
+```text
+cowork.app      → runtime-manifest.json + 可选内嵌 archive
+runtime package → runtime.json + bin/cowork-host + node/ + dsh/
+用户目录        → ~/.cowork/runtimes/<id>/
+用户状态        → ~/.dsh/（与 runtime 分开）
+```
+
+`legacy` 的 `Resources/runtime/node_modules` 保留为兼容路径，但不是新发行形态。
+
 ## crate 划分
 
 | crate | 职责 | 说明 |
