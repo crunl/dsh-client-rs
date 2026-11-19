@@ -16,8 +16,8 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use crate::completion;
 use crate::theme;
 use crate::{
-    CompletionItem, CtxMeter, EffortOption, ModelGroup, PresetInfo, SelectedModel, SessionInfo,
-    UiCommand, UiEvent,
+    CompletionItem, CtxMeter, EffortOption, HostLifecycle, ModelGroup, PresetInfo, SelectedModel,
+    SessionInfo, UiCommand, UiEvent,
 };
 use dsh_protocol::context::Occupancy;
 use dsh_protocol::transcript::{Entry, MessageId, ToolCall, ToolStatus};
@@ -88,9 +88,8 @@ pub struct Chat {
     title: String,
     /// 会话根的 `~` 缩写路径。
     path: String,
-    connected: bool,
-    /// host 被收起了（空闲休眠）。界面不依赖它活着：侧栏/时间线都是客户端自己的状态。
-    sleeping: bool,
+    /// host 生命周期。唯一来源是 supervisor；初始就是启动中。
+    host_state: HostLifecycle,
     /// 当前会话这一轮处在哪一步（composer 主按钮、时间线尾巴、侧栏点共用）。
     phase: Phase,
     /// 本轮开始的时刻；只在 `Sending` / `Running` 时有值，用来给「正在思考」计时。
@@ -434,8 +433,7 @@ impl Chat {
             workspace: "未连接".to_owned(),
             title: "新会话".to_owned(),
             path: String::new(),
-            connected: false,
-            sleeping: false,
+            host_state: HostLifecycle::Starting,
             phase: Phase::Idle,
             turn_started: None,
             sessions: Vec::new(),
@@ -560,17 +558,9 @@ impl Chat {
 
     fn handle_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
         match event {
-            UiEvent::Ready { origin } => {
-                tracing::info!(%origin, "host 就绪");
-                self.connected = true;
-                self.sleeping = false;
-            }
-            UiEvent::HostState { awake } => {
-                tracing::info!(awake, "host 状态");
-                self.sleeping = !awake;
-                if awake {
-                    self.connected = true;
-                }
+            UiEvent::HostState(state) => {
+                tracing::info!(?state, "host 状态");
+                self.host_state = state;
             }
             UiEvent::Connected {
                 origin,
@@ -578,7 +568,6 @@ impl Chat {
                 cwd,
             } => {
                 tracing::info!(%origin, %session, %cwd, "已连接 host");
-                self.connected = true;
                 self.workspace = leaf(&cwd);
                 self.path = tilde(&cwd);
                 self.title = short_id(&session).to_owned();
@@ -1727,13 +1716,7 @@ impl Chat {
     }
 
     fn side_foot(&self) -> impl IntoElement {
-        let (tone, label) = if self.sleeping {
-            (theme::INK_MUTED, "host 休眠中")
-        } else if self.connected {
-            (theme::OK, "dsh host")
-        } else {
-            (theme::INK_MUTED, "未连接")
-        };
+        let (tone, label) = host_status(self.host_state);
 
         div()
             .flex()
@@ -3388,6 +3371,16 @@ fn tilde(path: &str) -> String {
     }
 }
 
+/// 侧栏底部的 host 状态点：文案与色调只由生命周期枚举决定。
+fn host_status(state: HostLifecycle) -> (u32, &'static str) {
+    match state {
+        HostLifecycle::Starting => (theme::INK_MUTED, "host 启动中"),
+        HostLifecycle::Ready => (theme::OK, "dsh host"),
+        HostLifecycle::Sleeping => (theme::INK_MUTED, "host 休眠中"),
+        HostLifecycle::Failed => (theme::INK_MUTED, "host 启动失败"),
+    }
+}
+
 /// 会话 id 太长，标题栏只留尾部。
 fn short_id(session: &str) -> &str {
     let keep = 8;
@@ -3400,10 +3393,10 @@ fn short_id(session: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ModelGroup, PullRow, SelectedModel, TranscriptView, format_tokens, leaf, model_menu_rows,
-        short_id, tool_runs,
+        ModelGroup, PullRow, SelectedModel, TranscriptView, format_tokens, host_status, leaf,
+        model_menu_rows, short_id, tool_runs,
     };
-    use crate::ModelOption;
+    use crate::{HostLifecycle, ModelOption};
 
     fn group(provider: &str, models: &[(&str, &str)]) -> ModelGroup {
         ModelGroup {
@@ -3467,6 +3460,14 @@ mod tests {
         assert!(rows[0].selected);
         assert_eq!(rows[0].hint.as_deref(), Some("DeepSeek"));
         assert!(!rows[1].selected);
+    }
+
+    #[test]
+    fn host_status_covers_every_lifecycle_state() {
+        assert_eq!(host_status(HostLifecycle::Starting).1, "host 启动中");
+        assert_eq!(host_status(HostLifecycle::Ready).1, "dsh host");
+        assert_eq!(host_status(HostLifecycle::Sleeping).1, "host 休眠中");
+        assert_eq!(host_status(HostLifecycle::Failed).1, "host 启动失败");
     }
 
     #[test]

@@ -105,19 +105,27 @@ pub struct PresetInfo {
     pub name: String,
 }
 
+/// host 生命周期的互斥状态。
+///
+/// 只有 supervisor 发布这些状态：UI 不再从「没收到事件」推断 host 死活。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HostLifecycle {
+    /// 正在安装 runtime / 拉起 host / 等握手。
+    #[default]
+    Starting,
+    /// host 已握手，可以服务命令。
+    Ready,
+    /// 空闲后主动收起 host；有命令会重新拉起。
+    Sleeping,
+    /// 这一代 host 启动或握手失败。
+    Failed,
+}
+
 /// 外部推给界面的东西。
 #[derive(Debug)]
 pub enum UiEvent {
-    /// host 握手成功。没有会话时也会发（空状态要显示已连上）。
-    Ready {
-        /// host 的 origin。
-        origin: String,
-    },
-    /// host 的生死状态。空闲到点会收掉 host（只留客户端），有命令再拉起来。
-    HostState {
-        /// `true` = 这一代 host 已拉起并握手；`false` = 已收起。
-        awake: bool,
-    },
+    /// host 生命周期变化。启动、休眠、唤醒、失败都从这里来。
+    HostState(HostLifecycle),
     /// 切到了某个会话（快照已回放完毕）。
     Connected {
         /// host 的 origin。

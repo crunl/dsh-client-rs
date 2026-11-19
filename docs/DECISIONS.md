@@ -2104,3 +2104,23 @@ app                   → ensure runtime → spawn bin/cowork-host → 接 ready
 - `plain` 首次启动需要网络；离线用户应使用 `embedded`。
 - 当前 launcher 仍是 shell `exec`，ready URL 继续从 host 输出中识别；把 ready 行收进 launcher
   是后续独立优化，不影响本决策的 runtime 边界。
+
+## #53 host 生命周期：supervisor 单一发布状态
+
+**日期**：2026-11
+
+**决策**：host 状态从 `connected` / `sleeping` 两个布尔改成互斥枚举
+`HostLifecycle { Starting, Ready, Sleeping, Failed }`，由 supervisor 在状态迁移处发布，
+UI 只做投影。两个布尔会允许非法组合，也会把「还没收到事件」误渲染成「未连接」。
+
+**状态迁移**：
+
+```text
+启动/唤醒 → Starting
+握手成功   → Ready
+空闲收起   → Sleeping
+启动/握手失败 → Failed
+```
+
+`UiEvent::Failed` 继续承载具体错误文案，但不再代表 host 生命周期；普通命令失败不改变状态。
+侧栏文案一一映射：`host 启动中` / `dsh host` / `host 休眠中` / `host 启动失败`。

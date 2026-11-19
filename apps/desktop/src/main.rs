@@ -20,8 +20,8 @@ mod instance;
 
 use dsh_client_ui::completion;
 use dsh_client_ui::{
-    CompletionItem, EffortOption, ModelGroup, ModelOption, PresetInfo, SelectedModel, SessionInfo,
-    UiCommand, UiEvent,
+    CompletionItem, EffortOption, HostLifecycle, ModelGroup, ModelOption, PresetInfo,
+    SelectedModel, SessionInfo, UiCommand, UiEvent,
 };
 use dsh_host::{Connection, FollowStream};
 use dsh_protocol::catalog::{ModelCatalog, PermissionCatalog};
@@ -91,6 +91,7 @@ fn main() {
 
 /// 起一个专用线程跑 tokio，负责全部 host I/O 与 host 的生死。
 fn spawn_host_supervisor(commands: Receiver<UiCommand>, events: Sender<UiEvent>) {
+    let failure_events = events.clone();
     let spawned = std::thread::Builder::new()
         .name("dsh-host-io".to_owned())
         .spawn(move || {
@@ -101,6 +102,7 @@ fn spawn_host_supervisor(commands: Receiver<UiCommand>, events: Sender<UiEvent>)
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
+                    let _ = events.blocking_send(UiEvent::HostState(HostLifecycle::Failed));
                     let _ = events
                         .blocking_send(UiEvent::Failed(format!("tokio 运行时启动失败: {error}")));
                     return;
@@ -110,6 +112,9 @@ fn spawn_host_supervisor(commands: Receiver<UiCommand>, events: Sender<UiEvent>)
         });
 
     if let Err(error) = spawned {
+        let _ = failure_events.try_send(UiEvent::HostState(HostLifecycle::Failed));
+        let _ =
+            failure_events.try_send(UiEvent::Failed(format!("无法启动 host I/O 线程: {error}")));
         tracing::error!(%error, "无法启动 host I/O 线程");
     }
 }
@@ -142,10 +147,15 @@ async fn supervisor_loop(mut commands: Receiver<UiCommand>, events: Sender<UiEve
     let mut pending: Option<UiCommand> = None;
 
     loop {
+        let _ = events
+            .send(UiEvent::HostState(HostLifecycle::Starting))
+            .await;
+
         let startup = match host::start() {
             Ok(startup) => startup,
             Err(error) => {
                 tracing::error!(%error, "无法拉起 host");
+                let _ = events.send(UiEvent::HostState(HostLifecycle::Failed)).await;
                 let _ = events
                     .send(UiEvent::Failed(format!("无法拉起 host: {error}")))
                     .await;
@@ -156,6 +166,7 @@ async fn supervisor_loop(mut commands: Receiver<UiCommand>, events: Sender<UiEve
         let conn = match Connection::connect(&startup.ready_url).await {
             Ok(conn) => Arc::new(conn),
             Err(error) => {
+                let _ = events.send(UiEvent::HostState(HostLifecycle::Failed)).await;
                 let _ = events
                     .send(UiEvent::Failed(format!("握手失败: {error}")))
                     .await;
@@ -174,13 +185,14 @@ async fn supervisor_loop(mut commands: Receiver<UiCommand>, events: Sender<UiEve
             Outcome::Sleep { active } => {
                 resume = active;
                 tracing::info!("空闲，收起 host");
-                let _ = events.send(UiEvent::HostState { awake: false }).await;
+                let _ = events
+                    .send(UiEvent::HostState(HostLifecycle::Sleeping))
+                    .await;
                 // 命令不能丢：拿到的第一条当作下一代的第一条命令。
                 match commands.recv().await {
                     Some(command) => {
                         pending = Some(command);
                         tracing::info!("有活了，重新拉起 host");
-                        let _ = events.send(UiEvent::HostState { awake: true }).await;
                     }
                     None => return,
                 }
@@ -232,11 +244,7 @@ async fn host_loop(
     // `events` 是个克隆的发送端：后面的 bootstrap 与命令分支照旧用 `&events`。
     let events: Sender<UiEvent> = events.clone();
 
-    let _ = events
-        .send(UiEvent::Ready {
-            origin: conn.origin().trim_end_matches('/').to_owned(),
-        })
-        .await;
+    let _ = events.send(UiEvent::HostState(HostLifecycle::Ready)).await;
     load_presets(&conn, &events).await;
     load_models(&conn, &events).await;
     let mut known = refresh_sessions(&conn, &events, None).await;
