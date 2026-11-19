@@ -2174,5 +2174,67 @@ node-pty 文件，压缩体积减少约 91MB。full 包重生成后 hash 与已�
 **验证**：`tests/test_package_runtime.py` 覆盖每类排除、未知资源保留、目标 engine 选择与
 id 校验；`scripts/runtime/smoke-runtime.sh` 跑 `probe` / `model` / `workspaces` / `follow`。
 code 包还做了隔离冷启动（`Starting → Ready`）、真实工具调用（`tool/call` → `tool/result`）
-和一次正常文本 prompt。正式 app 未替换为 code 包；后续如需切换，使用
-`COWORK_RUNTIME_PACKAGE_DIR=runtime-build/code ./scripts/build-product.sh`。
+和一次正常文本 prompt。随后经用户批准，正式 `/Applications/cowork.app` 已替换为 code 包；
+如需切换到其他包，使用 `COWORK_RUNTIME_PACKAGE_DIR=<目录> ./scripts/build-product.sh`。
+
+## #55 runtime 生命周期：一个深模块管理不可变 runtime 集合
+
+**日期**：2026-11-20
+
+**决策**：把 runtime 的发现、安装、选择、校验、状态与回收从 `host.rs` 收进
+`apps/desktop/src/runtime.rs`。`host.rs` 只向它要 `ActiveRuntime::argv()` 并管进程；
+supervisor 握手成功后通过 `RuntimeControl::MarkReady` 回报状态。UI 生命周期不变，
+仍是 `Starting / Ready / Sleeping / Failed`。
+
+**外部 seam** 只有四个操作：
+
+```text
+activate(RuntimeRequest::{Default|Id|Dir}) -> ActiveRuntime
+status()                                    -> RuntimeStatus
+control(RuntimeControl::{Use|MarkReady|MarkVerified})
+collect(CollectMode::{DryRun|Apply})       -> CollectReport
+```
+
+CLI adapter 复用同一模块：`cowork runtime status / activate / use / verify / gc`。
+它不拿 app 的单实例锁、不开窗，也不写 `$DSH_HOME`。`verify` 会把 `$DSH_HOME`
+复制到临时目录、拉起隔离 host、把 ready URL 以 `0600` 交给
+`scripts/runtime/smoke-runtime.sh`，脚本成功才写 `last_verified`。
+
+**选择顺序**：
+
+```text
+COWORK_RUNTIME          临时目录
+COWORK_RUNTIME_ID       一次性 id 覆盖
+state.selection=Pin     用户持久选择
+runtime-manifest.json   app 钉住的 desired
+legacy runtime          兼容兜底
+```
+
+显式选择缺失或损坏时报错，不静默回退；desired 缺失或损坏时按 manifest 重装。
+
+**状态**：`~/.cowork/state.json`，临时文件 + fsync + rename，`0600`。
+`~/.cowork/runtime.lock` 用 PID 锁串行化所有状态写入；活进程持锁时拒绝并发，
+陈旧锁可回收。`history` 只留最近 50 条，`last_good` 来自握手成功，`last_verified`
+只在 smoke 脚本完整通过后写入。
+
+**首次迁移保护**：旧机器可能已经有 rc.3 / rc.5 full / rc.5 code 等多个目录。
+第一次生成 state 时把所有已安装的合法 runtime 放进 `bootstrap_protected`。
+用户显式执行 `cowork runtime use <id|auto>` 后，这一揽子保护清空；此后由 desired、
+pin、last_good、last_verified 组成保护集合。GC 只处理合法、未保护的 `~/.cowork/runtimes/<id>/`，
+`Apply` 是移动到 `~/.cowork/runtime-quarantine/<id>-<ts>/`，不是删除。
+`.install`、`.download`、`.bad-*` 和隐藏目录不进入候选。
+
+**为什么**：
+
+- 继续把 env 判断、tar、锁、状态写在 `host.rs` 会让每个 caller 都学一遍实现细节；
+  现在 interface 是测试面，caller 只学一个封闭 enum 和四个操作。
+- 用户状态与 runtime 状态分开：`~/.dsh` 不写 runtime 选择，`~/.cowork` 不写会话/凭据。
+- 回收必须由引用关系决定，不能靠目录名或年龄猜；首次迁移保护避免升级当天丢回滚版本。
+
+**代价**：
+
+- `runtime status` 会遍历目录计算体积，版本多时有秒级开销；这是诊断命令，不在启动热路径。
+- `verify` 要求本机有仓库里的 `scripts/runtime/smoke-runtime.sh`（或用
+  `COWORK_SMOKE_SCRIPT` 指向等价脚本）以及可用的 `cargo`；它会跑真实模型调用，
+  失败不会写 `last_verified`。
+- 正式 `/Applications/cowork.app` 仍保留上一版二进制，直到显式重建安装。

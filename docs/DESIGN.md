@@ -78,6 +78,10 @@ runtime package → runtime.json + bin/cowork-host + node/ + dsh/
 
 `legacy` 的 `Resources/runtime/node_modules` 保留为兼容路径，但不是新发行形态。
 
+runtime 生命周期由 `apps/desktop/src/runtime.rs` 统一负责：选择、安装、last_good、
+last_verified 与回收都在 `~/.cowork/state.json` / `~/.cowork/runtimes/` / `~/.cowork/runtime-quarantine/`；
+`host.rs` 只消费 `ActiveRuntime` 的 argv 并管理进程（#55）。
+
 ## crate 划分
 
 | crate | 职责 | 说明 |

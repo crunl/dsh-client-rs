@@ -17,6 +17,9 @@
 mod cache;
 mod host;
 mod instance;
+mod runtime;
+
+use runtime::{RuntimeControl, RuntimeRequest, RuntimeStore};
 
 use dsh_client_ui::completion;
 use dsh_client_ui::{
@@ -51,6 +54,19 @@ fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // CLI adapter：与 GUI 共用 RuntimeStore，但不拿单实例锁、不开窗。
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("runtime") {
+        match runtime::cli(&args[2..]) {
+            Ok(output) => print!("{output}"),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     let (command_tx, command_rx) = tokio::sync::mpsc::channel::<UiCommand>(8);
     let (event_tx, event_rx) = tokio::sync::mpsc::channel::<UiEvent>(256);
@@ -145,13 +161,14 @@ async fn supervisor_loop(mut commands: Receiver<UiCommand>, events: Sender<UiEve
     // 休眠前记住在哪个会话里，醒来接着跟（`session/follow` 会重放快照）。
     let mut resume: Option<String> = std::env::var("DSH_DEBUG_OPEN").ok();
     let mut pending: Option<UiCommand> = None;
+    let store = RuntimeStore::from_env();
 
     loop {
         let _ = events
             .send(UiEvent::HostState(HostLifecycle::Starting))
             .await;
 
-        let startup = match host::start() {
+        let startup = match host::start(&store, RuntimeRequest::Default) {
             Ok(startup) => startup,
             Err(error) => {
                 tracing::error!(%error, "无法拉起 host");
@@ -175,6 +192,12 @@ async fn supervisor_loop(mut commands: Receiver<UiCommand>, events: Sender<UiEve
                 return;
             }
         };
+
+        if let Some(id) = &startup.runtime_id
+            && let Err(error) = store.control(RuntimeControl::MarkReady(id.clone()))
+        {
+            tracing::warn!(%error, id, "记录 runtime last_good 失败");
+        }
 
         let outcome = host_loop(conn, resume.clone(), pending.take(), &mut commands, &events).await;
         // 这一代 host（含看门狗）在这里收。
