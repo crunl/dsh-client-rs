@@ -131,7 +131,7 @@ pub fn start_isolated(
     command
         .arg("-c")
         .arg(script)
-        .env("DSH_HOME", &home)
+        .env("DSH_HOME", home)
         // host 的日志里有 ANSI 与进度条，抓 URL 时用不上。
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())
