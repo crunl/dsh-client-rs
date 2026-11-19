@@ -8,7 +8,7 @@
 
 use dsh_protocol::fold::{AssistantStreamFold, FoldOutcome};
 use dsh_protocol::workspace::WorkspaceRegistry;
-use gpui_kit::base::input::{Input, InputEditorStyle, InputEvent, InputState};
+use gpui_kit::base::input::{InputEditorStyle, InputEvent, Textarea, TextareaState};
 use gpui_kit::*;
 use std::collections::HashMap;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -75,7 +75,7 @@ impl TranscriptView {
 
 /// 主视图。
 pub struct Chat {
-    input: Entity<InputState>,
+    input: Entity<TextareaState>,
     entries: Vec<Entry>,
     fold: AssistantStreamFold,
     /// 本地已显示、host 还没给 `seq` 的消息计数器（只用于 `Entry::User` 的身份）。
@@ -311,7 +311,13 @@ impl Chat {
         commands: Sender<UiCommand>,
     ) -> Self {
         let input = cx.new(|cx| {
-            let mut state = InputState::new(window, cx).placeholder("给 dsh 说点什么…");
+            // 多行输入：`submit_on_enter` 让裸 Enter 只发 `PressEnter`（不插换行），
+            // 换行留给 `Shift+Enter`（库内已是这个口径）；
+            // auto grow 从 1 行长到 6 行，再高就自己滚。
+            let mut state = TextareaState::new(window, cx)
+                .placeholder("给 dsh 说点什么…")
+                .submit_on_enter(true);
+            state.set_auto_grow(1, 6, cx);
             // 不投影编辑器样式时，caret 取默认调色板的 foreground（近黑），
             // 在深色卡片上等于看不见；正文/占位/选中也一并按主题给。
             state.set_editor_style(InputEditorStyle {
@@ -327,7 +333,7 @@ impl Chat {
             state
         });
 
-        // 不聚焦就没有插入符：InputState 只在获焦时闪烁光标。
+        // 不聚焦就没有插入符：输入框只在获焦时闪烁光标。
         // 构造时窗口还没上屏，聚焦会被丢弃，所以首帧后再补一次；
         // 之后每次窗口被激活都重新聚焦，符合「点回来就能直接打字」的预期。
         input.update(cx, |state, cx| state.focus(window, cx));
@@ -771,7 +777,7 @@ impl Chat {
         self.completion = None;
         self.input.update(cx, |state, cx| {
             state.set_value(next, window, cx);
-            // 单行输入框 set_value 会把光标丢到末尾；这里按插入点摆回去。
+            // `set_value` 会把光标丢到末尾；这里按插入点摆回去。
             state.set_selected_range(caret..caret, cx);
         });
         cx.notify();
@@ -2431,7 +2437,7 @@ impl Chat {
                         div()
                             .w_full()
                             .text_size(px(theme::BODY))
-                            .child(Input::new(&self.input)),
+                            .child(Textarea::new(&self.input)),
                     )
                     .child(
                         div()

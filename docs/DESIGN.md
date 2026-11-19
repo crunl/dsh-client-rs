@@ -181,6 +181,9 @@ dsh-client-rs 通用渲染器（Rust）
 右端是 `model` | `effort` | ctx 圆环（32px 环形进度）| cache。
 `mode` 下拉不在这一行——它在输入卡片的按钮行左侧（#50），那行右端是 send / stop。
 
+输入框本身是**多行**的：`Enter` 发送（不插换行）、`Shift+Enter` 插换行，
+卡片跟着长高（自动涨到 6 行，再高就在卡片内滚动）。实现与理由见 DECISIONS #51。
+
 数据绑定（wire 结构与语义见 PROTOCOL.md「statusline（composer 控制条）数据源」）：
 
 | 位 | 源 | 说明 |

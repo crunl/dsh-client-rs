@@ -2013,3 +2013,38 @@ magpie dsh default              # 把 magpie 从 dsh 里摘出去
 
 **代价**：与官方 desktop 的 composer 摆法不同（官方在 statusline 左端）。
 这是有意的偏离，按 #47/#48 的同一口径：位置跟操作距离走，不跟设计稿逐像素走。
+
+## #51 composer 换成多行输入：Enter 发送，Shift+Enter 换行
+
+**日期**：2026-11
+
+**决策**：输入框从 `InputState`（单行）换成 `TextareaState`（多行），
+构造时 `submit_on_enter(true)` + `set_auto_grow(1, 6)`：
+
+```rust
+let mut state = TextareaState::new(window, cx)
+    .placeholder("给 dsh 说点什么…")
+    .submit_on_enter(true);
+state.set_auto_grow(1, 6, cx);   // 1 行起，长到 6 行，再高就卡片内滚动
+```
+
+**为什么**：`Shift+Enter` 换行是聊天输入框的默认约定；单行输入框里它什么也不做。
+而且这一步不需要自己拦键——`InputState = InputBaseState<InputMode>` 的
+`MULTI_LINE = false`，`TextareaState` 的 `MULTI_LINE = true`，库在
+「多行 + `submit_on_enter`」时已经是这个口径：裸 `Enter` 只发
+`InputEvent::PressEnter`（不插换行），`Shift+Enter` 插换行（同时仍发一个
+`shift: true` 的事件，我们的处理器只认 `shift: false`，所以不会误发）。
+
+**实测**（release `.app`，`DSH_DEBUG_KEYS` 合成按键）：
+
+| 动作 | 结果 |
+| --- | --- |
+| 草稿 `abc` + 按 `Enter` | 日志 `测试模式：拦下这次投递 chars=3`，卡片保持 1 行——没有插换行，走了发送 |
+| 草稿 `第一行文字` + `Shift+Enter` | 卡片从 1 行（78pt）涨到 2 行（101pt），文字落到第二行（`set_value` 把光标放在 0，换行插在它前面） |
+| `DSH_DEBUG_COMPLETE=$'第一行\n第二行'` | 两行同时渲染，卡片高度按内容自适应 |
+
+**副作用**：草稿可以带换行，`send` 只 `trim` 两端，内部换行原样进 prompt；
+卡片超过 6 行后在输入框内部滚动，不再继续挤压时间线。
+
+**调试**：`DSH_DEBUG_KEYS` 白名单加了 `shift-enter`（原先只有 up/down/enter/tab/escape/shift-tab），
+这个开关跑起来时 `send` 仍自动进测试模式，不会真投递。

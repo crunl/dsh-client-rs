@@ -380,6 +380,7 @@ pub fn run(events: Receiver<UiEvent>, commands: Sender<UiCommand>) {
                                     "tab" => "tab",
                                     "escape" => "escape",
                                     "shift-tab" => "shift-tab",
+                                    "shift-enter" => "shift-enter",
                                     _ => "down",
                                 })
                                 .collect();
