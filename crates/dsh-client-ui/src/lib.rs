@@ -40,6 +40,9 @@ pub struct SidebarPrefs {
     /// 老客户端建会话只传 `cwd`，host 从未把这些 id 记进账本；重建工作区时
     /// 靠它们把会话拉回原组，避免整组在侧栏里消失。
     pub adopted: HashMap<String, Vec<String>>,
+    /// 用户在本客户端主动移除的会话 id。
+    /// host 没有删会话的命令，所以这里只是本地过滤；远端记录不受影响。
+    pub deleted_session_ids: HashSet<String>,
 }
 
 /// 上下文用量。分子是 `usage.inputTokens`——实测它就是「这轮喂进去多少」。

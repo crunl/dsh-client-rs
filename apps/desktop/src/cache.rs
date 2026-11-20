@@ -39,6 +39,8 @@ pub struct CachedPrefs {
     pub hidden_workspace_ids: Vec<String>,
     #[serde(default)]
     pub adopted: Vec<CachedAdoption>,
+    #[serde(default)]
+    pub deleted_session_ids: Vec<String>,
 }
 
 /// 一条「历史会话归到某工作区」的覆盖。
@@ -138,6 +140,7 @@ impl Snapshot {
                         session_ids: session_ids.clone(),
                     })
                     .collect(),
+                deleted_session_ids: prefs.deleted_session_ids.iter().cloned().collect(),
             },
         }
     }
@@ -152,6 +155,7 @@ impl Snapshot {
                 .iter()
                 .map(|item| (item.workspace_id.clone(), item.session_ids.clone()))
                 .collect(),
+            deleted_session_ids: self.prefs.deleted_session_ids.iter().cloned().collect(),
         }
     }
 
@@ -262,7 +266,8 @@ mod tests {
               "pinned": [],
               "prefs": {
                 "hiddenWorkspaceIds": ["w2"],
-                "adopted": [{"workspaceId":"w1","sessionIds":["s3"]}]
+                "adopted": [{"workspaceId":"w1","sessionIds":["s3"]}],
+                "deletedSessionIds": ["s4"]
               }
             }"#,
         )
@@ -290,6 +295,7 @@ mod tests {
             prefs.adopted.get("w1").map(Vec::as_slice),
             Some(["s3".to_owned()].as_slice())
         );
+        assert!(prefs.deleted_session_ids.contains("s4"));
     }
 
     #[test]

@@ -25,6 +25,14 @@ use dsh_protocol::transcript::ToolStatus;
 use dsh_protocol::{ChatTimeline, RenderId, TimelineRow, ToolFamily, ToolResultView, ToolView};
 use gpui_kit::assets::IconName;
 
+/// 设置模式的两个应用级视图：偏好与归档会话。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SettingsTab {
+    #[default]
+    General,
+    Archive,
+}
+
 /// 主视图。
 pub struct Chat {
     input: Entity<TextareaState>,
@@ -58,6 +66,8 @@ pub struct Chat {
     settings_saved: bool,
     /// settings 页面是否覆盖主区。
     settings_open: bool,
+    /// 设置模式当前 Tab。
+    settings_tab: SettingsTab,
     /// 每个工具行正文的开合覆盖；单个工具正文始终是手动展开。
     tool_open: HashMap<String, bool>,
     /// 每个 reasoning 块的正文开合覆盖；会话内状态，不写设置。
@@ -82,6 +92,8 @@ pub struct Chat {
     pending_delete: Option<String>,
     /// 正在等二次确认的**运行中**会话 id（归档会停掉它，所以先问一句）。
     pending_archive: Option<String>,
+    /// 归档页里等二次确认的「从本机移除」会话 id。
+    pending_session_delete: Option<String>,
     /// 按键拦截器的订阅；丢掉就失效，所以必须攥在手里。
     _completion_keys: Subscription,
     /// 当前会话的权限 preset（composer 左侧 mode）。
@@ -401,6 +413,7 @@ impl Chat {
             settings_error: None,
             settings_saved: false,
             settings_open: false,
+            settings_tab: SettingsTab::default(),
             tool_open: HashMap::new(),
             reasoning_open: HashMap::new(),
             debug_tools_open: std::env::var("DSH_DEBUG_TOOL_OPEN").is_ok(),
@@ -414,6 +427,7 @@ impl Chat {
             prefs: SidebarPrefs::default(),
             pending_delete: None,
             pending_archive: None,
+            pending_session_delete: None,
             mode: String::new(),
             mode_options: Vec::new(),
             mode_open: false,
@@ -936,10 +950,12 @@ impl Chat {
             .child(self.side_close(cx))
     }
 
-    /// 设置导航：按真值归属分组，只渲染非空组（#57 不摆空占位）。
+    /// 设置导航：顶部两个 Tab 分应用级偏好与归档会话；偏好按真值归属分组。
     fn settings_side_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let back = cx.entity();
-        div()
+        let general = cx.entity();
+        let archive = cx.entity();
+        let mut body = div()
             .id("settings-side-body")
             .flex()
             .flex_col()
@@ -970,40 +986,114 @@ impl Chat {
             )
             .child(
                 div()
-                    .px(px(8.))
-                    .pt(px(10.))
-                    .pb(px(4.))
-                    .text_size(px(theme::META))
-                    .text_color(rgb(theme::INK_MUTED))
-                    .child("HOST 设置"),
-            )
-            .child(
-                div()
-                    .id(ElementId::Name("settings-nav:chat".into()))
                     .flex()
                     .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .px(px(8.))
-                    .py(px(6.))
-                    .rounded(px(6.))
-                    .bg(rgb(theme::BG_HOVER))
-                    .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(rgb(theme::INK)))
+                    .gap_1()
+                    .pt(px(10.))
                     .child(
                         div()
+                            .id("settings-tab-general")
+                            .flex_1()
+                            .text_center()
+                            .py(px(6.))
+                            .rounded(px(6.))
+                            .bg(rgb(if self.settings_tab == SettingsTab::General {
+                                theme::BG_HOVER
+                            } else {
+                                theme::BG_SIDEBAR
+                            }))
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                general.update(cx, |chat, cx| {
+                                    chat.settings_tab = SettingsTab::General;
+                                    cx.notify();
+                                });
+                            })
                             .text_size(px(theme::UI))
-                            .text_color(rgb(theme::INK))
-                            .child("聊天 · 详略"),
+                            .text_color(rgb(if self.settings_tab == SettingsTab::General {
+                                theme::INK
+                            } else {
+                                theme::INK_SOFT
+                            }))
+                            .child("通用"),
+                    )
+                    .child(
+                        div()
+                            .id("settings-tab-archive")
+                            .flex_1()
+                            .text_center()
+                            .py(px(6.))
+                            .rounded(px(6.))
+                            .bg(rgb(if self.settings_tab == SettingsTab::Archive {
+                                theme::BG_HOVER
+                            } else {
+                                theme::BG_SIDEBAR
+                            }))
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                archive.update(cx, |chat, cx| {
+                                    chat.settings_tab = SettingsTab::Archive;
+                                    cx.notify();
+                                });
+                            })
+                            .text_size(px(theme::UI))
+                            .text_color(rgb(if self.settings_tab == SettingsTab::Archive {
+                                theme::INK
+                            } else {
+                                theme::INK_SOFT
+                            }))
+                            .child("归档"),
                     ),
-            )
-            .child(
+            );
+        if self.settings_tab == SettingsTab::General {
+            body = body
+                .child(
+                    div()
+                        .px(px(8.))
+                        .pt(px(10.))
+                        .pb(px(4.))
+                        .text_size(px(theme::META))
+                        .text_color(rgb(theme::INK_MUTED))
+                        .child("HOST 设置"),
+                )
+                .child(
+                    div()
+                        .id(ElementId::Name("settings-nav:chat".into()))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .px(px(8.))
+                        .py(px(6.))
+                        .rounded(px(6.))
+                        .bg(rgb(theme::BG_HOVER))
+                        .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(rgb(theme::INK)))
+                        .child(
+                            div()
+                                .text_size(px(theme::UI))
+                                .text_color(rgb(theme::INK))
+                                .child("聊天 · 详略"),
+                        ),
+                )
+                .child(
+                    div()
+                        .px(px(8.))
+                        .pt(px(8.))
+                        .text_size(px(theme::META))
+                        .text_color(rgb(theme::INK_MUTED))
+                        .child("真值在 dsh profile，经 host API 读写"),
+                );
+        } else {
+            body = body.child(
                 div()
                     .px(px(8.))
-                    .pt(px(8.))
+                    .pt(px(10.))
                     .text_size(px(theme::META))
                     .text_color(rgb(theme::INK_MUTED))
-                    .child("真值在 dsh profile，经 host API 读写"),
-            )
+                    .child("归档会话可恢复，或从本机移除"),
+            );
+        }
+        body
     }
 
     fn side_top(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1238,20 +1328,6 @@ impl Chat {
             }
         }
 
-        // 归档区：默认收起，展开才列出那几条。归档 = 从常驻列表里拿走，记录仍在
-        // （host 没有删会话的接口，只有 `archiveSession` / `unarchiveSession`）。
-        let archived = self.archived_sessions();
-        if !archived.is_empty() {
-            let key = ARCHIVED_KEY.to_owned();
-            let open = self.expanded.get(&key).copied().unwrap_or(false);
-            body = body.child(self.archived_header(key.clone(), archived.len(), open, cx));
-            if open {
-                for session in archived {
-                    body = body.child(self.archived_row(&key, session, cx));
-                }
-            }
-        }
-
         body
     }
 
@@ -1260,7 +1336,10 @@ impl Chat {
         let mut items: Vec<&SessionInfo> = self
             .sessions
             .iter()
-            .filter(|session| self.registry.is_archived(&session.id))
+            .filter(|session| {
+                self.registry.is_archived(&session.id)
+                    && !self.prefs.deleted_session_ids.contains(&session.id)
+            })
             .collect();
         items.sort_by_key(|item| std::cmp::Reverse(item.updated_at));
         items
@@ -1339,7 +1418,10 @@ impl Chat {
                 .entry(workspace.workspace_id.clone())
                 .or_default();
             for session in sessions {
-                if session.blank || registry.is_archived(&session.id) || owned.contains(&session.id)
+                if session.blank
+                    || registry.is_archived(&session.id)
+                    || owned.contains(&session.id)
+                    || prefs.deleted_session_ids.contains(&session.id)
                 {
                     continue;
                 }
@@ -1565,6 +1647,11 @@ impl Chat {
                     self.pending_archive = None;
                 }
             }
+            ConfirmKind::SessionDelete => {
+                if self.pending_session_delete.as_deref() == Some(id) {
+                    self.pending_session_delete = None;
+                }
+            }
         }
     }
 
@@ -1582,6 +1669,10 @@ impl Chat {
             }
             ConfirmKind::SessionArchive => {
                 self.archive_session(id);
+            }
+            ConfirmKind::SessionDelete => {
+                self.pending_session_delete = None;
+                self.delete_session(id);
             }
         }
     }
@@ -1607,6 +1698,15 @@ impl Chat {
         let _ = self
             .commands
             .try_send(UiCommand::UnarchiveSession { session_id: id });
+    }
+
+    /// 从本客户端移除一条归档会话。host 没有删会话命令，只做本地过滤并落快照；
+    /// 远端记录仍在，不假装它被删除了。
+    fn delete_session(&mut self, id: String) {
+        self.prefs.deleted_session_ids.insert(id);
+        let _ = self
+            .commands
+            .try_send(UiCommand::SaveSidebarPrefs(self.prefs.clone()));
     }
 
     /// 仅调试：等价于点会话行尾的「归档」，走同一条命令通道。
@@ -1743,122 +1843,6 @@ impl Chat {
                 .text_color(rgb(theme::INK_MUTED))
                 .child(time),
         )
-    }
-
-    /// 「已归档 N」标题行，默认收起。
-    fn archived_header(
-        &self,
-        key: String,
-        count: usize,
-        open: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let entity = cx.entity();
-        let arrow = if open {
-            IconName::ChevronDown
-        } else {
-            IconName::ChevronRight
-        };
-
-        div()
-            .id(ElementId::Name("archived:header".into()))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .mt(px(6.))
-            .px(px(8.))
-            .py(px(6.))
-            .rounded(px(6.))
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(theme::BG_HOVER)))
-            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                entity.update(cx, |chat, cx| {
-                    let next = !chat.expanded.get(&key).copied().unwrap_or(false);
-                    chat.expanded.insert(key.clone(), next);
-                    cx.notify();
-                });
-            })
-            .child(icon(arrow, 12.0, theme::INK_MUTED))
-            .child(
-                div()
-                    .text_size(px(theme::META))
-                    .text_color(rgb(theme::INK_MUTED))
-                    .child(format!("已归档 {count}")),
-            )
-            .child(div().flex_1())
-    }
-
-    /// 归档区里的一行：标题 + hover 才出现「取消归档」。
-    fn archived_row(
-        &self,
-        _key: &str,
-        session: &SessionInfo,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let title = session
-            .title
-            .clone()
-            .unwrap_or_else(|| short_id(&session.id).to_owned());
-        let id = session.id.clone();
-        let entity = cx.entity();
-        let open = entity.clone();
-        let open_id = id.clone();
-
-        div()
-            .id(ElementId::Name(format!("archived:{}", session.id).into()))
-            .group("archived-row")
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .pl(px(24.))
-            .pr(px(8.))
-            .py(px(5.))
-            .rounded(px(6.))
-            .cursor_pointer()
-            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                open.update(cx, |chat, cx| {
-                    if chat.active_session == open_id {
-                        return;
-                    }
-                    if chat
-                        .commands
-                        .try_send(UiCommand::OpenSession(open_id.clone()))
-                        .is_ok()
-                    {
-                        chat.active_session = open_id.clone();
-                        chat.finish_turn();
-                        chat.timeline = ChatTimeline::new();
-                        cx.notify();
-                    }
-                });
-            })
-            .hover(|style| style.bg(rgb(theme::BG_HOVER)))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .truncate()
-                    .text_size(px(theme::ROW))
-                    .text_color(rgb(theme::INK_MUTED))
-                    .child(title),
-            )
-            .child(
-                div()
-                    .opacity(0.)
-                    .cursor_pointer()
-                    .group_hover("archived-row", |style| style.opacity(1.))
-                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                        let id = id.clone();
-                        entity.update(cx, |chat, cx| {
-                            chat.unarchive_session(id);
-                            cx.notify();
-                        });
-                        cx.stop_propagation();
-                    })
-                    .child(icon(IconName::Undo2, 12.0, theme::INK_MUTED)),
-            )
     }
 
     fn side_foot(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2025,6 +2009,145 @@ impl Chat {
             )
     }
 
+    /// 归档 Tab：恢复走 host `unarchiveSession`，删除只是本客户端移除（host 无删会话 API）。
+    fn archive_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let archived = self.archived_sessions();
+        let mut list = div().flex().flex_col().gap_2();
+        for session in &archived {
+            let id = session.id.clone();
+            let title = session
+                .title
+                .clone()
+                .unwrap_or_else(|| short_id(&session.id).to_owned());
+            let time = relative_time(session.updated_at);
+            let restore = cx.entity();
+            let remove = cx.entity();
+            let confirming = self.pending_session_delete.as_deref() == Some(id.as_str());
+            let mut row = div()
+                .id(ElementId::Name(format!("archive:{}", session.id).into()))
+                .group("archive-row")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .px(px(12.))
+                .py(px(10.))
+                .rounded(px(6.))
+                .bg(rgb(theme::BG_CARD))
+                .border_1()
+                .border_color(rgb(theme::BG_CARD_EDGE))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_size(px(theme::UI))
+                        .text_color(rgb(theme::INK))
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_size(px(theme::META))
+                        .text_color(rgb(theme::INK_MUTED))
+                        .child(time),
+                );
+            if confirming {
+                row = row.child(self.confirm_bar(
+                    "archive-delete",
+                    &id,
+                    ConfirmKind::SessionDelete,
+                    cx,
+                ));
+            } else {
+                let restore_id = id.clone();
+                let remove_id = id.clone();
+                row = row
+                    .child(
+                        div()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(theme::BG_HOVER)))
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                let target = restore_id.clone();
+                                restore.update(cx, |chat, cx| {
+                                    chat.unarchive_session(target);
+                                    cx.notify();
+                                });
+                                cx.stop_propagation();
+                            })
+                            .text_size(px(theme::META))
+                            .text_color(rgb(theme::INK_SOFT))
+                            .child("恢复"),
+                    )
+                    .child(
+                        div()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(theme::BG_HOVER)))
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                let target = remove_id.clone();
+                                remove.update(cx, |chat, cx| {
+                                    chat.pending_session_delete = Some(target);
+                                    cx.notify();
+                                });
+                                cx.stop_propagation();
+                            })
+                            .child(icon(IconName::Delete, 12.0, theme::INK_MUTED)),
+                    );
+            }
+            list = list.child(row);
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
+            .child(
+            div()
+                .id("archive-scroll")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .w_full()
+                .max_w(px(theme::CONTENT_W))
+                .mx_auto()
+                .px(px(theme::GUTTER))
+                .py(px(theme::GUTTER))
+                .gap_6()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(px(theme::BODY))
+                                .text_color(rgb(theme::INK))
+                                .child("归档"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(theme::META))
+                                .text_color(rgb(theme::INK_MUTED))
+                                .child(
+                                    "归档会话可恢复到原工作区，或从本机移除；移除不影响 host 记录",
+                                ),
+                        ),
+                )
+                .child(if archived.is_empty() {
+                    div()
+                        .text_size(px(theme::META))
+                        .text_color(rgb(theme::INK_MUTED))
+                        .child("没有归档会话")
+                        .into_any_element()
+                } else {
+                    list.into_any_element()
+                }),
+        )
+    }
+
     /// 应用档位只影响默认值；已展开的会话内覆盖清掉，让新档位立即生效。
     /// 真值由 host 回送，这里只更新内存镜像。
     fn apply_verbosity(&mut self, verbosity: ChatVerbosity) {
@@ -2039,7 +2162,10 @@ impl Chat {
     fn main(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // 还没选工作区 / 没有会话：主区是空状态，不是聊天区。
         let body = if self.settings_open {
-            self.settings_page(cx).into_any_element()
+            match self.settings_tab {
+                SettingsTab::General => self.settings_page(cx).into_any_element(),
+                SettingsTab::Archive => self.archive_page(cx).into_any_element(),
+            }
         } else if self.active_session.is_empty() {
             self.empty_state(cx).into_any_element()
         } else {
@@ -3780,8 +3906,6 @@ impl Phase {
 }
 
 /// 侧栏的「已归档」区用一个不会撞路径的键记展开态。
-const ARCHIVED_KEY: &str = "\u{1}已归档";
-
 /// 行内确认的种类：决定「取消」清哪个 pending、「确认」发哪条命令。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfirmKind {
@@ -3789,6 +3913,8 @@ enum ConfirmKind {
     WorkspaceDelete,
     /// 归档一条会话。
     SessionArchive,
+    /// 从本客户端移除一条归档会话。
+    SessionDelete,
 }
 
 impl ConfirmKind {
@@ -3797,6 +3923,7 @@ impl ConfirmKind {
         match self {
             ConfirmKind::WorkspaceDelete => "移除",
             ConfirmKind::SessionArchive => "归档",
+            ConfirmKind::SessionDelete => "删除",
         }
     }
 }
@@ -3860,7 +3987,9 @@ fn group_plan(
 
     let mut buckets: HashMap<&str, Vec<&SessionInfo>> = HashMap::new();
     for session in sessions.iter().filter(|session| {
-        (!session.blank || session.id == active_session) && !registry.is_archived(&session.id)
+        (!session.blank || session.id == active_session)
+            && !registry.is_archived(&session.id)
+            && !prefs.deleted_session_ids.contains(&session.id)
     }) {
         if hidden_ids.contains(session.id.as_str()) {
             continue;
@@ -4217,6 +4346,23 @@ mod tests {
             ..Default::default()
         };
         let plan = group_plan(&sessions, &registry, &SidebarPrefs::default(), "");
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].3, vec!["s1"]);
+    }
+
+    /// 从本机移除的会话不再出现在侧栏，即使 host 账本仍记着它。
+    #[test]
+    fn locally_deleted_sessions_are_excluded() {
+        let sessions = vec![session("s1", "/a", 2), session("s2", "/a", 1)];
+        let registry = WorkspaceRegistry {
+            items: vec![workspace("w1", "/a", "A", &["s1", "s2"])],
+            ..Default::default()
+        };
+        let prefs = SidebarPrefs {
+            deleted_session_ids: HashSet::from(["s2".to_owned()]),
+            ..Default::default()
+        };
+        let plan = group_plan(&sessions, &registry, &prefs, "");
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].3, vec!["s1"]);
     }
