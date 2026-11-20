@@ -74,10 +74,12 @@ profile 固定为 **`cowork`**，存在 `$DSH_HOME/profiles/cowork`
 | `DSH_READY_URL` 可手动指定 | 带 token 的 ready URL，走 `/connect`（开发期逃生口，不是产品路径） |
 | `DSH_HOME` 可覆盖 | 想隔离就用 `open -n cowork/cowork.app --env DSH_HOME=/path` |
 | `COWORK_PROFILE` 可覆盖 profile 名 | 同时跑两个隔离实例用 |
-| 启动就有侧栏，不等 host | `~/Library/Application Support/cowork/state.json` 存侧栏快照（会话/工作区/归档），启动先画再等真实数据；不缓存时间线（#44） |
+| 启动就有侧栏，不等 host | `~/Library/Application Support/cowork/state.json` 存侧栏快照（会话/工作区/归档/隐藏与历史归属），启动先画再等真实数据；不缓存时间线（#44、#58） |
 | 空闲就收掉 host，有活再拉 | 空闲 `COWORK_SLEEP_IDLE_SECS`（缺省 600，`0` 关闭）；休眠时只剩客户端，接口/会话不丢，唤醒约 2.4s（#44） |
 | node 不打包 | 构建时把 `node` 绝对路径写进 `node-path.txt`；Node 换版本后重跑一次脚本，或设 `COWORK_NODE` |
-| 启动先选工作区，不自动建会话 | 主区是空状态：列出已注册工作区 + 「添加工作区…」；会话建在你选的那个目录下，不会落进「未分组」（#43） |
+| 启动先选工作区，不自动建会话 | 主区是空状态：列出已注册工作区 + 「添加工作区…」；会话建在你选的那个目录下，一定属于该工作区（#43） |
+| 侧栏没有「未分组」 | Workspace 只显示工作区；无归属的历史会话不在侧栏出现（仍在 host 上，可搜索访问）（#58） |
+| 移除工作区是可逆隐藏 | 侧栏「移除」只本地隐藏整组，不删 host 注册/会话；隐藏组的会话一起不显示，底部「已隐藏的工作区」可恢复；重新添加同一目录后老会话归位（#58） |
 | 工具调用按 `callId` 配成一行，三档展开 | 历史与实时走同一个折叠器（`dsh-protocol` 的 `Transcript`）；标准档默认收起过程组，点行看输出，任何档位都不自动灌正文（#47） |
 | 助手正文按 markdown 渲染 | 用 gpui-base 自带 `TextView::markdown`（Apache-2.0，已在依赖树）；身份用 `(turn, step)`，流式与提交后同一 key；工具输出不解析（#48） |
 | 没有凭据时模型格显示「请选择模型」 | 对齐官方文案；目录空时下拉里是「暂无可用模型」，提供方失败逐条列出（#42） |

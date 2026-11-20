@@ -14,7 +14,9 @@ pub mod context;
 pub mod files;
 pub mod fold;
 pub mod session;
+pub mod settings;
 pub mod stream;
+pub mod timeline;
 pub mod transcript;
 pub mod wire;
 pub mod workspace;
@@ -22,6 +24,10 @@ pub mod workspace;
 pub use catalog::{ModelCatalog, PermissionCatalog};
 pub use fold::{Apply, AssistantStreamFold, Block, FoldOutcome};
 pub use session::{SessionListValue, SessionSummary};
+pub use settings::{SettingsDescribeValue, SettingsNamespaceView};
 pub use stream::{AssistantStreamFrame, FollowValue, StreamChunk, StreamItem, TokenUsage};
+pub use timeline::{
+    ChatTimeline, RenderId, TimelineRow, ToolDetail, ToolFamily, ToolResultView, ToolView,
+};
 pub use transcript::{Entry, MessageId, ToolCall, ToolStatus, Transcript};
 pub use wire::{ClientRequest, Payload, RpcError, RpcResult, ServerResponse};

@@ -14,15 +14,33 @@ pub mod brand;
 pub mod chat;
 pub mod completion;
 pub mod markdown;
+pub mod settings;
 pub mod theme;
 
 pub use chat::Chat;
+pub use settings::{ChatVerbosity, RenderPolicy, Settings};
 
 use dsh_protocol::context::Occupancy;
 use dsh_protocol::stream::AssistantStreamFrame;
 use dsh_protocol::transcript::{Entry, ToolCall};
 use gpui_kit::*;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc::{Receiver, Sender};
+
+/// 侧栏的客户端私有偏好。
+///
+/// host 的注册表只表达「有哪些工作区、它记账了哪些会话」；「用户主动收起了
+/// 哪个工作区」以及「host 账本里没有、但确实属于某个工作区的历史会话」是
+/// 客户端自己的事，不塞进 `WorkspaceRegistry`，也不写 host。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SidebarPrefs {
+    /// 被移出侧栏的工作区 id。host 注册与账本都还在，只是不显示。
+    pub hidden_workspace_ids: HashSet<String>,
+    /// `workspace_id -> [session_id]`：补 host 账本缺的历史会话。
+    /// 老客户端建会话只传 `cwd`，host 从未把这些 id 记进账本；重建工作区时
+    /// 靠它们把会话拉回原组，避免整组在侧栏里消失。
+    pub adopted: HashMap<String, Vec<String>>,
+}
 
 /// 上下文用量。分子是 `usage.inputTokens`——实测它就是「这轮喂进去多少」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +157,8 @@ pub enum UiEvent {
     Sessions(Vec<SessionInfo>),
     /// 工作区注册表 + 归档/置顶集合（`workspace/follow` 的基线 + 增量）。
     Workspaces(dsh_protocol::workspace::WorkspaceRegistry),
+    /// 侧栏私有偏好（隐藏集合 + 历史归属覆盖）。先于首批会话/工作区事件到达。
+    SidebarPrefs(SidebarPrefs),
     /// 切换会话后回放的历史。
     Transcript(Vec<Entry>),
     /// 一次工具调用的状态变化（发起或拿到结果）。按 `callId` upsert。
@@ -151,6 +171,15 @@ pub enum UiEvent {
         occupancy: Option<Occupancy>,
         /// 缓存命中率百分比；没有输入时为 `None`。
         cache_hit: Option<u8>,
+    },
+    /// 全局聊天详略；启动从 host profile 读，settings 页写回后回送权威值。
+    ChatVerbosity {
+        /// 实际生效的档位。
+        verbosity: ChatVerbosity,
+        /// 读/写 host 设置失败时的说明；成功为 `None`。
+        error: Option<String>,
+        /// 这是点击后的写回确认（用于显示「已保存」），不是启动/重连时的读取。
+        saved: bool,
     },
     /// 模型目录（启动时一次）与未配置会话时的默认选择。
     Models {
@@ -195,19 +224,18 @@ pub enum UiCommand {
     OpenSession(String),
     /// 在某个工作区新建会话。
     NewSession {
-        /// 工作区路径。
+        /// 工作区路径（标题栏与侧栏显示用）。
         cwd: String,
+        /// 工作区 id。`session/create` 必须带它，host 才会把会话记进账本。
+        workspace_id: String,
     },
     /// 把一个已有目录注册成工作区。
     AddWorkspace {
         /// 目录绝对路径。
         path: String,
     },
-    /// 从侧栏移除一个工作区注册（不删目录、不删会话）。
-    DeleteWorkspace {
-        /// 工作区 id。
-        workspace_id: String,
-    },
+    /// 侧栏私有偏好变化，落本地快照。不碰 host 注册与账本。
+    SaveSidebarPrefs(SidebarPrefs),
     /// 归档一个会话：从侧栏收起，记录与目录都留着，随时可取消归档。
     ArchiveSession {
         /// 会话 id。
@@ -247,6 +275,13 @@ pub enum UiCommand {
         /// 推理强度 id；模型不支持推理时为 `None`。
         effort: Option<String>,
     },
+    /// 把聊天详略写回 host profile。
+    SetChatVerbosity {
+        /// 用户点选的档位。
+        verbosity: ChatVerbosity,
+        /// 点击前生效的档位，写失败时 UI 用它回滚。
+        previous: ChatVerbosity,
+    },
 }
 
 impl UiCommand {
@@ -257,7 +292,7 @@ impl UiCommand {
             Self::OpenSession(_) => "OpenSession",
             Self::NewSession { .. } => "NewSession",
             Self::AddWorkspace { .. } => "AddWorkspace",
-            Self::DeleteWorkspace { .. } => "DeleteWorkspace",
+            Self::SaveSidebarPrefs(_) => "SaveSidebarPrefs",
             Self::ArchiveSession { .. } => "ArchiveSession",
             Self::UnarchiveSession { .. } => "UnarchiveSession",
             Self::Cancel { .. } => "Cancel",
@@ -265,6 +300,7 @@ impl UiCommand {
             Self::SetMode(_) => "SetMode",
             Self::Complete { .. } => "Complete",
             Self::SetModel { .. } => "SetModel",
+            Self::SetChatVerbosity { .. } => "SetChatVerbosity",
         }
     }
 }

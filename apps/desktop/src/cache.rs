@@ -5,7 +5,7 @@
 //!
 //! 位置：`$HOME/Library/Application Support/cowork/state.json`（原子替换写）。
 
-use dsh_client_ui::{SelectedModel, SessionInfo};
+use dsh_client_ui::{SelectedModel, SessionInfo, SidebarPrefs};
 use dsh_protocol::workspace::{WorkspaceRegistry, WorkspaceView};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -26,6 +26,28 @@ pub struct Snapshot {
     /// 已置顶会话 id。
     #[serde(default)]
     pub pinned: Vec<String>,
+    /// 侧栏私有偏好：隐藏的工作区与历史归属覆盖。
+    #[serde(default)]
+    pub prefs: CachedPrefs,
+}
+
+/// `SidebarPrefs` 的落盘形状，字段用数组表达（JSON 对象键不稳定）。
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedPrefs {
+    #[serde(default)]
+    pub hidden_workspace_ids: Vec<String>,
+    #[serde(default)]
+    pub adopted: Vec<CachedAdoption>,
+}
+
+/// 一条「历史会话归到某工作区」的覆盖。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedAdoption {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub session_ids: Vec<String>,
 }
 
 /// 会话摘要的落盘形状（字段少而稳，不跟协议字段名绑死）。
@@ -65,11 +87,18 @@ pub struct CachedWorkspace {
     pub path: String,
     #[serde(default)]
     pub title: String,
+    /// host 账本里的会话 id；先前版本没有这个字段，解析时按空处理。
+    #[serde(default)]
+    pub session_ids: Vec<String>,
 }
 
 impl Snapshot {
     /// 从当前会话列表与注册表拍一张。
-    pub fn capture(sessions: &[SessionInfo], registry: &WorkspaceRegistry) -> Self {
+    pub fn capture(
+        sessions: &[SessionInfo],
+        registry: &WorkspaceRegistry,
+        prefs: &SidebarPrefs,
+    ) -> Self {
         Self {
             sessions: sessions
                 .iter()
@@ -94,10 +123,35 @@ impl Snapshot {
                     workspace_id: workspace.workspace_id.clone(),
                     path: workspace.path.clone(),
                     title: workspace.title.clone(),
+                    session_ids: workspace.session_ids.clone(),
                 })
                 .collect(),
             archived: registry.archived_session_ids.clone(),
             pinned: registry.pinned_session_ids.clone(),
+            prefs: CachedPrefs {
+                hidden_workspace_ids: prefs.hidden_workspace_ids.iter().cloned().collect(),
+                adopted: prefs
+                    .adopted
+                    .iter()
+                    .map(|(workspace_id, session_ids)| CachedAdoption {
+                        workspace_id: workspace_id.clone(),
+                        session_ids: session_ids.clone(),
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    /// 还原侧栏私有偏好。旧快照缺字段时解析为默认，不崩溃。
+    pub fn prefs(&self) -> SidebarPrefs {
+        SidebarPrefs {
+            hidden_workspace_ids: self.prefs.hidden_workspace_ids.iter().cloned().collect(),
+            adopted: self
+                .prefs
+                .adopted
+                .iter()
+                .map(|item| (item.workspace_id.clone(), item.session_ids.clone()))
+                .collect(),
         }
     }
 
@@ -133,7 +187,7 @@ impl Snapshot {
                     workspace_id: workspace.workspace_id.clone(),
                     path: workspace.path.clone(),
                     title: workspace.title.clone(),
-                    session_ids: Vec::new(),
+                    session_ids: workspace.session_ids.clone(),
                     created_at: None,
                     updated_at: None,
                 })
@@ -203,9 +257,13 @@ mod tests {
                  "mode":"workspace-write",
                  "model":{"provider":"deepseek-official","model":"deepseek-v4-flash","effort":"high"}}
               ],
-              "workspaces": [{"workspaceId":"w1","path":"/tmp/ws","title":"ws"}],
+              "workspaces": [{"workspaceId":"w1","path":"/tmp/ws","title":"ws","sessionIds":["s1"]}],
               "archived": ["s2"],
-              "pinned": []
+              "pinned": [],
+              "prefs": {
+                "hiddenWorkspaceIds": ["w2"],
+                "adopted": [{"workspaceId":"w1","sessionIds":["s3"]}]
+              }
             }"#,
         )
         .expect("快照应可解析");
@@ -223,7 +281,15 @@ mod tests {
         let registry = snapshot.registry();
         assert_eq!(registry.items.len(), 1);
         assert_eq!(registry.items[0].path, "/tmp/ws");
+        assert_eq!(registry.items[0].session_ids, vec!["s1".to_owned()]);
         assert_eq!(registry.archived_session_ids, vec!["s2".to_owned()]);
+
+        let prefs = snapshot.prefs();
+        assert!(prefs.hidden_workspace_ids.contains("w2"));
+        assert_eq!(
+            prefs.adopted.get("w1").map(Vec::as_slice),
+            Some(["s3".to_owned()].as_slice())
+        );
     }
 
     #[test]

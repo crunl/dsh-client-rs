@@ -16,6 +16,7 @@
 
 mod cache;
 mod host;
+mod host_settings;
 mod instance;
 mod runtime;
 
@@ -24,7 +25,7 @@ use runtime::{RuntimeControl, RuntimeRequest, RuntimeStore};
 use dsh_client_ui::completion;
 use dsh_client_ui::{
     CompletionItem, EffortOption, HostLifecycle, ModelGroup, ModelOption, PresetInfo,
-    SelectedModel, SessionInfo, UiCommand, UiEvent,
+    SelectedModel, SessionInfo, SidebarPrefs, UiCommand, UiEvent,
 };
 use dsh_host::{Connection, FollowStream};
 use dsh_protocol::catalog::{ModelCatalog, PermissionCatalog};
@@ -39,8 +40,8 @@ use dsh_protocol::stream::{AssistantStreamFrame, StreamChunk};
 use dsh_protocol::stream::{FollowValue, StreamItemKind};
 use dsh_protocol::transcript::{Entry, Transcript};
 use dsh_protocol::workspace::{
-    ArchiveSessionRequest, WorkspaceArchiveValue, WorkspaceCreated, WorkspaceDeleted,
-    WorkspaceFollowFrame, WorkspaceRegistry,
+    ArchiveSessionRequest, WorkspaceArchiveValue, WorkspaceCreated, WorkspaceFollowFrame,
+    WorkspaceRegistry,
 };
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -73,11 +74,16 @@ fn main() {
 
     // 侧栏先用本地快照画：host 还在拉/还在休眠时也不至于空着。
     // 只还原侧栏，不还原时间线——历史的真相在 `session/follow`。
+    let mut initial_prefs = SidebarPrefs::default();
     if let Some(snapshot) = cache::load() {
         tracing::info!(sessions = snapshot.sessions.len(), "读到本地侧栏快照");
+        initial_prefs = snapshot.prefs();
+        // 偏好必须排在会话/工作区之前：界面收到首批列表时才能正确收养历史会话。
+        let _ = event_tx.try_send(UiEvent::SidebarPrefs(initial_prefs.clone()));
         let _ = event_tx.try_send(UiEvent::Sessions(snapshot.sessions()));
         let _ = event_tx.try_send(UiEvent::Workspaces(snapshot.registry()));
     }
+    let sidebar_prefs = Arc::new(Mutex::new(initial_prefs));
 
     // 同一个 profile 只开一个窗口进程：双击两次不该起两个 host 抢同一个 DSH_HOME。
     let profile = std::env::var("COWORK_PROFILE").unwrap_or_else(|_| host::PROFILE.to_owned());
@@ -98,7 +104,7 @@ fn main() {
 
     // 窗口先出来：host 由 supervisor 在线程里拉起/收起，不再阻塞在开窗前。
     // 它也不再绑定 app 生命周期：空闲一阵就收掉（见 `host_loop` 的 idle 分支）。
-    spawn_host_supervisor(command_rx, event_tx);
+    spawn_host_supervisor(command_rx, event_tx, sidebar_prefs);
     dsh_client_ui::run(event_rx, command_tx);
 
     // 锁在这个作用域里，退出时 drop；host 由 supervisor 线程自己收。
@@ -106,7 +112,11 @@ fn main() {
 }
 
 /// 起一个专用线程跑 tokio，负责全部 host I/O 与 host 的生死。
-fn spawn_host_supervisor(commands: Receiver<UiCommand>, events: Sender<UiEvent>) {
+fn spawn_host_supervisor(
+    commands: Receiver<UiCommand>,
+    events: Sender<UiEvent>,
+    sidebar_prefs: Arc<Mutex<SidebarPrefs>>,
+) {
     let failure_events = events.clone();
     let spawned = std::thread::Builder::new()
         .name("dsh-host-io".to_owned())
@@ -124,7 +134,7 @@ fn spawn_host_supervisor(commands: Receiver<UiCommand>, events: Sender<UiEvent>)
                     return;
                 }
             };
-            runtime.block_on(supervisor_loop(commands, events));
+            runtime.block_on(supervisor_loop(commands, events, sidebar_prefs));
         });
 
     if let Err(error) = spawned {
@@ -157,7 +167,11 @@ enum Outcome {
 /// 为什么不让 host 活到 app 退出：一个空闲 host 常驻 ~385MB（实测：web 系
 /// profile、无对话、三次中位数），而客户端自己 ~85MB。north star 是 RAM，
 /// 所以 agent 运行时只在「有活要干」时存在；重拉一次到 ready 约 2.4s。
-async fn supervisor_loop(mut commands: Receiver<UiCommand>, events: Sender<UiEvent>) {
+async fn supervisor_loop(
+    mut commands: Receiver<UiCommand>,
+    events: Sender<UiEvent>,
+    sidebar_prefs: Arc<Mutex<SidebarPrefs>>,
+) {
     // 休眠前记住在哪个会话里，醒来接着跟（`session/follow` 会重放快照）。
     let mut resume: Option<String> = std::env::var("DSH_DEBUG_OPEN").ok();
     let mut pending: Option<UiCommand> = None;
@@ -199,7 +213,15 @@ async fn supervisor_loop(mut commands: Receiver<UiCommand>, events: Sender<UiEve
             tracing::warn!(%error, id, "记录 runtime last_good 失败");
         }
 
-        let outcome = host_loop(conn, resume.clone(), pending.take(), &mut commands, &events).await;
+        let outcome = host_loop(
+            conn,
+            resume.clone(),
+            pending.take(),
+            &mut commands,
+            &events,
+            Arc::clone(&sidebar_prefs),
+        )
+        .await;
         // 这一代 host（含看门狗）在这里收。
         drop(startup.process);
 
@@ -233,6 +255,70 @@ fn idle_timeout() -> Option<std::time::Duration> {
     (seconds > 0).then(|| std::time::Duration::from_secs(seconds))
 }
 
+/// 启动时把 host profile 里的聊天详略投影给 UI。读失败也发一次，
+/// 让 settings 页显示原因；UI 自己不持久化这个偏好。
+///
+/// 休眠醒来时若第一条就是切档命令，不要让旧值先把用户的乐观选择盖回去；
+/// 那条命令写完会回送权威值。
+async fn load_chat_verbosity(
+    conn: &Connection,
+    events: &Sender<UiEvent>,
+    first: Option<&UiCommand>,
+) {
+    if matches!(first, Some(UiCommand::SetChatVerbosity { .. })) {
+        return;
+    }
+    let event = match host_settings::describe(conn).await {
+        Ok(setting) => UiEvent::ChatVerbosity {
+            verbosity: setting.verbosity,
+            error: None,
+            saved: false,
+        },
+        Err(error) => {
+            tracing::warn!(%error, "读聊天详略失败");
+            UiEvent::ChatVerbosity {
+                verbosity: dsh_client_ui::ChatVerbosity::default(),
+                error: Some(error),
+                saved: false,
+            }
+        }
+    };
+    let _ = events.send(event).await;
+}
+
+/// settings 页点选后的权威写回。先乐观画 UI，再把 host 确认值（或失败回滚值）发回去。
+async fn write_chat_verbosity(
+    conn: &Connection,
+    events: &Sender<UiEvent>,
+    verbosity: dsh_client_ui::ChatVerbosity,
+    previous: dsh_client_ui::ChatVerbosity,
+) {
+    let result = async {
+        let setting = host_settings::describe(conn).await?;
+        host_settings::update(conn, setting.revision, verbosity).await
+    }
+    .await;
+    let event = match result {
+        Ok(actual) => {
+            tracing::info!(verbosity = actual.host_key(), "聊天详略已写入 host profile");
+            UiEvent::ChatVerbosity {
+                verbosity: actual,
+                error: None,
+                saved: true,
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "写聊天详略失败，回滚");
+            UiEvent::ChatVerbosity {
+                verbosity: previous,
+                error: Some(error),
+                saved: false,
+            }
+        }
+    };
+    let _ = events.send(event).await;
+}
+
 /// 还有没有在跑的轮？收 host 前得问一次：服务端才是权威。
 ///
 /// 出错时按「有活」处理：宁可多留一会儿，也不要在用户用着的时候把 host 抽掉。
@@ -257,9 +343,10 @@ async fn any_turn_running(conn: &Connection) -> bool {
 async fn host_loop(
     conn: Arc<Connection>,
     resume: Option<String>,
-    first: Option<UiCommand>,
+    mut first: Option<UiCommand>,
     commands: &mut Receiver<UiCommand>,
     events: &Sender<UiEvent>,
+    sidebar_prefs: Arc<Mutex<SidebarPrefs>>,
 ) -> Outcome {
     // 启动时不再随手在 `$HOME` 里建会话：那样建出来的会话既不在任何注册过的
     // 工作区里（侧栏落进「未分组」），cwd 也不是用户想干活的地方。现在主区先
@@ -268,6 +355,7 @@ async fn host_loop(
     let events: Sender<UiEvent> = events.clone();
 
     let _ = events.send(UiEvent::HostState(HostLifecycle::Ready)).await;
+    load_chat_verbosity(&conn, &events, first.as_ref()).await;
     load_presets(&conn, &events).await;
     load_models(&conn, &events).await;
     let mut known = refresh_sessions(&conn, &events, None).await;
@@ -342,7 +430,6 @@ async fn host_loop(
     // 命令循环：空闲到点就主动收掉 host（RAM 只在「有活」时付）。
     let idle = idle_timeout();
     let mut last = tokio::time::Instant::now();
-    let mut first = first;
 
     loop {
         let command = match first.take().or(None) {
@@ -360,7 +447,7 @@ async fn host_loop(
                             }
                             let active_id = active.as_ref().map(|current| current.id.clone());
                             // 下一次醒来可能不再是同一个进程：先把侧栏拍下来。
-                            save_snapshot(&known, &registry);
+                            save_snapshot(&known, &registry, &sidebar_prefs);
                             shutting_down.store(true, Ordering::Relaxed);
                             // 先停回放任务；socket 随 `conn` 一起 drop。
                             if let Some(current) = active.take() {
@@ -374,7 +461,7 @@ async fn host_loop(
                 match received {
                     Some(command) => command,
                     None => {
-                        save_snapshot(&known, &registry);
+                        save_snapshot(&known, &registry, &sidebar_prefs);
                         return Outcome::Closed;
                     }
                 }
@@ -538,6 +625,12 @@ async fn host_loop(
                 );
                 let _ = events.send(UiEvent::Completions { seq, items }).await;
             }
+            UiCommand::SetChatVerbosity {
+                verbosity,
+                previous,
+            } => {
+                write_chat_verbosity(&conn, &events, verbosity, previous).await;
+            }
             UiCommand::SetModel {
                 provider,
                 model,
@@ -578,8 +671,8 @@ async fn host_loop(
                         json!({ "request": { "path": path } }),
                     )
                     .await;
-                let cwd = match registered {
-                    Ok(created) => created.workspace.path,
+                let created = match registered {
+                    Ok(created) => created,
                     Err(error) => {
                         let _ = events
                             .send(UiEvent::Failed(format!("添加工作区失败: {error}")))
@@ -587,12 +680,23 @@ async fn host_loop(
                         continue;
                     }
                 };
-                // 侧栏是按会话的 cwd 分组的，注册了目录却没有会话就看不见它，
-                // 所以顺手在该目录开一个空白会话，用户点一下就能用。
+                let cwd = created.workspace.path.clone();
+                let workspace_id = created.workspace.workspace_id.clone();
+                // `workspace/create` 按 canonical path 幂等：同一目录重新添加时
+                // `created=false`，host 注册与账本原封不动。取消客户端隐藏即可，
+                // 老会话随账本一起回到侧栏；只有真正新建才需要后续收养。
+                if !created.created {
+                    update_sidebar_prefs(&events, &sidebar_prefs, |prefs| {
+                        prefs.hidden_workspace_ids.remove(&workspace_id);
+                    });
+                }
+                // 注册了目录却没有会话就看不见它，所以开一个空白会话。
+                // 传 `workspaceId` 而不是 `cwd`：host 只有在前者时才会写账本，
+                // 否则新会话会在账本分组下掉进「未分组」。
                 match conn
                     .call::<SessionCreateValue>(
                         "session/create",
-                        json!({ "request": { "cwd": cwd } }),
+                        json!({ "request": { "workspaceId": workspace_id } }),
                     )
                     .await
                 {
@@ -607,18 +711,11 @@ async fn host_loop(
                     }
                 }
             }
-            UiCommand::DeleteWorkspace { workspace_id } => {
-                let deleted = conn
-                    .call::<WorkspaceDeleted>(
-                        "workspace/delete",
-                        json!({ "request": { "workspaceId": workspace_id } }),
-                    )
-                    .await;
-                if let Err(error) = deleted {
-                    let _ = events
-                        .send(UiEvent::Failed(format!("移除工作区失败: {error}")))
-                        .await;
-                }
+            UiCommand::SaveSidebarPrefs(next) => {
+                let mut guard = sidebar_prefs
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *guard = next;
             }
             UiCommand::ArchiveSession {
                 session_id,
@@ -638,11 +735,11 @@ async fn host_loop(
             UiCommand::UnarchiveSession { session_id } => {
                 unarchive_session(&conn, &events, &registry, &session_id).await;
             }
-            UiCommand::NewSession { cwd } => {
+            UiCommand::NewSession { cwd, workspace_id } => {
                 match conn
                     .call::<SessionCreateValue>(
                         "session/create",
-                        json!({ "request": { "cwd": cwd } }),
+                        json!({ "request": { "workspaceId": workspace_id } }),
                     )
                     .await
                 {
@@ -661,9 +758,25 @@ async fn host_loop(
 
         // 侧栏状态变了才拍快照：~20KB 一串 JSON，原子替换写。
         if persist {
-            save_snapshot(&known, &registry);
+            save_snapshot(&known, &registry, &sidebar_prefs);
         }
     }
+}
+
+/// 改侧栏私有偏好，并把权威值回送界面（界面自己也会乐观改，这里保证重连后一致）。
+fn update_sidebar_prefs(
+    events: &Sender<UiEvent>,
+    prefs: &Arc<Mutex<SidebarPrefs>>,
+    change: impl FnOnce(&mut SidebarPrefs),
+) {
+    let next = {
+        let mut guard = prefs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        change(&mut guard);
+        guard.clone()
+    };
+    let _ = events.try_send(UiEvent::SidebarPrefs(next));
 }
 
 /// 这条命令会对侧栏产生影响吗（新建/切会话、工作区增删、归档、一轮结束刷列表）。
@@ -676,7 +789,7 @@ fn touches_sidebar(command: &UiCommand) -> bool {
             | UiCommand::OpenSession(_)
             | UiCommand::NewSession { .. }
             | UiCommand::AddWorkspace { .. }
-            | UiCommand::DeleteWorkspace { .. }
+            | UiCommand::SaveSidebarPrefs(_)
             | UiCommand::ArchiveSession { .. }
             | UiCommand::UnarchiveSession { .. }
             | UiCommand::RefreshSessions
@@ -686,12 +799,20 @@ fn touches_sidebar(command: &UiCommand) -> bool {
 }
 
 /// 把当前侧栏状态写成本地快照。
-fn save_snapshot(known: &[dsh_client_ui::SessionInfo], registry: &Arc<Mutex<WorkspaceRegistry>>) {
+fn save_snapshot(
+    known: &[dsh_client_ui::SessionInfo],
+    registry: &Arc<Mutex<WorkspaceRegistry>>,
+    prefs: &Arc<Mutex<SidebarPrefs>>,
+) {
     let registry = match registry.lock() {
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     };
-    cache::save(&cache::Snapshot::capture(known, &registry));
+    let prefs = match prefs.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    cache::save(&cache::Snapshot::capture(known, &registry, &prefs));
     tracing::debug!(
         sessions = known.len(),
         workspaces = registry.items.len(),
@@ -765,10 +886,10 @@ async fn switch_to(
                         FollowValue::Event(event) => {
                             // 只推工具行：用户/助手消息由快照与流式帧负责，
                             // 否则同一个事件会在界面上出现两次。
-                            if let Some(index) = live.push_event(&event.event)
-                                && let Some(Entry::Tool(call)) = live.entry(index)
-                            {
-                                let _ = reader_events.send(UiEvent::Tool(call.clone())).await;
+                            for index in live.push_event(&event.event) {
+                                if let Some(Entry::Tool(call)) = live.entry(index) {
+                                    let _ = reader_events.send(UiEvent::Tool(call.clone())).await;
+                                }
                             }
                         }
                         FollowValue::AssistantStream(value) => {

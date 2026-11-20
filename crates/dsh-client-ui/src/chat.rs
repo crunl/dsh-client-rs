@@ -6,80 +6,30 @@
 //! 数据流是单向的：外部把 [`UiEvent`] 推进 channel，本视图消费后更新状态，
 //! 用户输入通过 [`UiCommand`] 推回去。视图内**不做网络**。
 
-use dsh_protocol::fold::{AssistantStreamFold, FoldOutcome};
 use dsh_protocol::workspace::WorkspaceRegistry;
 use gpui_kit::base::input::{InputEditorStyle, InputEvent, Textarea, TextareaState};
 use gpui_kit::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::completion;
+use crate::markdown::TextRole;
+use crate::settings::{ChatVerbosity, RenderPolicy, Settings};
 use crate::theme;
 use crate::{
     CompletionItem, CtxMeter, EffortOption, HostLifecycle, ModelGroup, PresetInfo, SelectedModel,
-    SessionInfo, UiCommand, UiEvent,
+    SessionInfo, SidebarPrefs, UiCommand, UiEvent,
 };
 use dsh_protocol::context::Occupancy;
-use dsh_protocol::transcript::{Entry, MessageId, ToolCall, ToolStatus};
+use dsh_protocol::transcript::ToolStatus;
+use dsh_protocol::{ChatTimeline, RenderId, TimelineRow, ToolFamily, ToolResultView, ToolView};
 use gpui_kit::assets::IconName;
-
-/// 工作步骤展示模式（对齐官方 `ui-chat.transcriptView` 的三档，桌面默认「标准」）。
-///
-/// 差别只在**过程组**怎么组织，不在单个工具正文：任何档位下单行正文都靠手动展开，
-/// 否则长输出会把时间线冲垮。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum TranscriptView {
-    /// 简洁：组头只给类别摘要。
-    Compact,
-    /// 标准：组头给摘要 + 运行中的实时提示。
-    #[default]
-    Standard,
-    /// 详细：运行中的轮次直接展开，历史轮次仍按手动开合。
-    Detailed,
-}
-
-impl TranscriptView {
-    fn label(self) -> &'static str {
-        match self {
-            TranscriptView::Compact => "简洁",
-            TranscriptView::Standard => "标准",
-            TranscriptView::Detailed => "详细",
-        }
-    }
-
-    /// 点一下换下一档，跑一圈回到起点。
-    ///
-    /// 没做成设置项是因为我们还没有设置面板：挂在组头旁边既看得见、又不用二次跳转。
-    fn next(self) -> Self {
-        match self {
-            TranscriptView::Compact => TranscriptView::Standard,
-            TranscriptView::Standard => TranscriptView::Detailed,
-            TranscriptView::Detailed => TranscriptView::Compact,
-        }
-    }
-
-    /// 启动时的默认档；`COWORK_TRANSCRIPT_VIEW` 可覆盖（也方便验收截图）。
-    fn from_env() -> Self {
-        match std::env::var("COWORK_TRANSCRIPT_VIEW").as_deref() {
-            Ok("compact") => TranscriptView::Compact,
-            Ok("detailed") => TranscriptView::Detailed,
-            _ => TranscriptView::default(),
-        }
-    }
-
-    /// 过程组正文默认是否展开。
-    fn group_body_open(self, running_turn: bool) -> bool {
-        matches!(self, TranscriptView::Detailed) && running_turn
-    }
-}
 
 /// 主视图。
 pub struct Chat {
     input: Entity<TextareaState>,
-    entries: Vec<Entry>,
-    fold: AssistantStreamFold,
-    /// 本地已显示、host 还没给 `seq` 的消息计数器（只用于 `Entry::User` 的身份）。
-    local_seq: u64,
+    /// 唯一时间线事实源；entries / stream / tool 更新都从这里进出。
+    timeline: ChatTimeline,
     meter: Option<CtxMeter>,
     commands: Sender<UiCommand>,
     /// 工作区名（取 cwd 的末段）。
@@ -100,13 +50,21 @@ pub struct Chat {
     active_session: String,
     /// 工作区展开状态，按 cwd 记；缺省展开。
     expanded: HashMap<String, bool>,
-    /// 工作步骤展示模式。
-    view: TranscriptView,
-    /// 已展开正文的工具行（`callId`）。
-    open_tools: std::collections::HashSet<String>,
-    /// 仅调试：把每个工具行的正文都当成展开（验收排版用）。
+    /// 全局界面设置的内存镜像。真值在 host profile 的 `ui-chat.transcriptView`。
+    settings: Settings,
+    /// host 设置读写失败说明；settings 页显示在选项下方。
+    settings_error: Option<String>,
+    /// 最近一次点击是否已被 host 确认写回（用于成功反馈）。
+    settings_saved: bool,
+    /// settings 页面是否覆盖主区。
+    settings_open: bool,
+    /// 每个工具行正文的开合覆盖；单个工具正文始终是手动展开。
+    tool_open: HashMap<String, bool>,
+    /// 每个 reasoning 块的正文开合覆盖；会话内状态，不写设置。
+    reasoning_open: HashMap<String, bool>,
+    /// 仅调试：把过程与正文都当成展开（验排版用）。
     debug_tools_open: bool,
-    /// 过程组的开合；没有记录的组按模式默认。
+    /// 过程组的开合；没有记录的组按档位默认。
     open_groups: HashMap<String, bool>,
     /// 左侧栏是否展开（侧栏顶部的关闭按钮收起，标题栏左侧的按钮展开）。
     sidebar_open: bool,
@@ -118,6 +76,8 @@ pub struct Chat {
     hover_completion: Option<usize>,
     /// 工作区注册表 + 归档/置顶集合（侧栏分组的唯一来源）。
     registry: WorkspaceRegistry,
+    /// 客户端私有侧栏偏好：隐藏集合 + 历史会话归属覆盖。
+    prefs: SidebarPrefs,
     /// 正在等二次确认的工作区 id（垃圾桶按一下不直接删）。
     pending_delete: Option<String>,
     /// 正在等二次确认的**运行中**会话 id（归档会停掉它，所以先问一句）。
@@ -425,9 +385,7 @@ impl Chat {
 
         Self {
             input,
-            entries: Vec::new(),
-            fold: AssistantStreamFold::new(),
-            local_seq: 0,
+            timeline: ChatTimeline::new(),
             meter: None,
             commands,
             workspace: "未连接".to_owned(),
@@ -439,8 +397,12 @@ impl Chat {
             sessions: Vec::new(),
             active_session: String::new(),
             expanded: HashMap::new(),
-            view: TranscriptView::from_env(),
-            open_tools: std::collections::HashSet::new(),
+            settings: Settings::default(),
+            settings_error: None,
+            settings_saved: false,
+            settings_open: false,
+            tool_open: HashMap::new(),
+            reasoning_open: HashMap::new(),
             debug_tools_open: std::env::var("DSH_DEBUG_TOOL_OPEN").is_ok(),
             open_groups: HashMap::new(),
             sidebar_open: true,
@@ -449,6 +411,7 @@ impl Chat {
             completion_seq: 0,
             hover_completion: None,
             registry: WorkspaceRegistry::default(),
+            prefs: SidebarPrefs::default(),
             pending_delete: None,
             pending_archive: None,
             mode: String::new(),
@@ -598,6 +561,11 @@ impl Chat {
                     }
                     self.model = active.model.clone();
                 }
+                self.adopt_legacy_sessions(cx);
+            }
+            UiEvent::SidebarPrefs(prefs) => {
+                self.prefs = prefs;
+                cx.notify();
             }
             UiEvent::Workspaces(registry) => {
                 tracing::debug!(
@@ -613,10 +581,20 @@ impl Chat {
                 );
                 self.registry = registry;
                 self.settle_pending();
+                self.adopt_legacy_sessions(cx);
                 cx.notify();
             }
             UiEvent::Presets(options) => {
                 self.mode_options = options;
+            }
+            UiEvent::ChatVerbosity {
+                verbosity,
+                error,
+                saved,
+            } => {
+                self.apply_verbosity(verbosity);
+                self.settings_error = error;
+                self.settings_saved = saved;
             }
             UiEvent::Context {
                 occupancy,
@@ -643,21 +621,14 @@ impl Chat {
                 if self.phase.is_busy() {
                     return;
                 }
-                self.fold = AssistantStreamFold::new();
-                self.entries = items;
-                self.open_tools.clear();
+                self.timeline.replace_snapshot(items);
+                self.tool_open.clear();
+                self.reasoning_open.clear();
                 self.open_groups.clear();
             }
             UiEvent::Tool(call) => {
-                // 按 `callId` upsert：发起时插一行，结果回来时原地补状态与正文。
-                match self
-                    .entries
-                    .iter_mut()
-                    .find(|entry| matches!(entry, Entry::Tool(existing) if existing.id == call.id))
-                {
-                    Some(Entry::Tool(existing)) => *existing = call,
-                    _ => self.entries.push(Entry::Tool(call)),
-                }
+                // 时间线模块按 `callId` upsert：发起插行，结果回来原地收尾。
+                self.timeline.apply_tool(call);
             }
             UiEvent::Frame(frame) => {
                 // 帧到了：进「正在思考」。
@@ -668,8 +639,8 @@ impl Chat {
                     self.turn_started = Some(std::time::Instant::now());
                 }
                 self.phase = Phase::Running;
-                self.fold.apply(&frame);
-                self.settle_if_done();
+                let effect = self.timeline.apply_stream(frame);
+                self.apply_stream_effect(effect);
             }
             UiEvent::Completions { seq, items } => {
                 // 只认最后一次请求的结果，早到的丢掉。
@@ -684,7 +655,7 @@ impl Chat {
             UiEvent::Failed(message) => {
                 tracing::warn!(%message, "链路失败");
                 self.finish_turn();
-                self.entries.push(Entry::Notice(message));
+                self.timeline.push_notice(message);
             }
         }
         cx.notify();
@@ -825,25 +796,12 @@ impl Chat {
         cx.notify();
     }
 
-    /// 流式尾巴的身份。
-    ///
-    /// `(turn, step)` 来自 `assistant-stream` 的 start 帧，与提交后的持久消息
-    /// 一致——这就是「流式 → 已提交」不重建排版的原因。拿不到时用
-    /// `local(0)` 占位：一屏只有一条活尾巴，稳定就够。
-    fn live_id(&self) -> MessageId {
-        match self.fold.turn_step() {
-            Some((turn, step)) => MessageId::Turn { turn, step },
-            None => MessageId::local(0),
-        }
-    }
-
-    /// 终局到达后把流式文本落成条目，并清空折叠器。
-    fn settle_if_done(&mut self) {
-        let Some(outcome) = self.fold.outcome().cloned() else {
+    /// 流末副作用：usage 记账 + 回合收尾。内容落行已经由时间线模块完成。
+    fn apply_stream_effect(&mut self, effect: dsh_protocol::timeline::StreamEffect) {
+        let Some(outcome) = effect.outcome else {
             return;
         };
-
-        if let Some(usage) = self.fold.usage() {
+        if let Some(usage) = effect.usage {
             tracing::info!(
                 input = usage.input_tokens,
                 cache_read = usage.cache_read_tokens,
@@ -854,37 +812,15 @@ impl Chat {
             );
             // 上下文里真实存在的是「未缓存输入 + 命中缓存」，两者都算喂进去的量。
             self.meter = Some(CtxMeter {
-                // 官方 contextTokens：未命中输入 + 缓存读 + 缓存写（三桶不重叠）。
                 used: usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens,
             });
         }
-
-        let text = self.fold.text();
-        // 流式尾巴的身份：与提交后的持久消息同一个 `(turn, step)`，
-        // 所以「流式 → 已提交」不换 key、不重排版。拿不到时用 local(0) 占位。
-        let live_id = self.live_id();
         tracing::info!(
             ?outcome,
-            chars = text.chars().count(),
+            chars = effect.chars,
             input_tokens = self.meter.map(|meter| meter.used),
             "回合完成"
         );
-
-        match outcome {
-            FoldOutcome::Committed { .. } => {
-                if !text.is_empty() {
-                    self.entries.push(Entry::Assistant { id: live_id, text });
-                }
-            }
-            FoldOutcome::Interrupted => {
-                if !text.is_empty() {
-                    self.entries.push(Entry::Assistant { id: live_id, text });
-                }
-                self.entries.push(Entry::Notice("生成被中断".to_owned()));
-            }
-        }
-
-        self.fold = AssistantStreamFold::new();
         self.finish_turn();
     }
 
@@ -906,11 +842,7 @@ impl Chat {
         self.model_open = false;
         self.effort_open = false;
         self.completion = None;
-        self.entries.push(Entry::User {
-            id: MessageId::local(self.local_seq),
-            text: text.clone(),
-        });
-        self.local_seq += 1;
+        self.timeline.push_user(text.clone());
         self.phase = Phase::Sending;
         self.turn_started = Some(std::time::Instant::now());
         self.input
@@ -918,8 +850,8 @@ impl Chat {
 
         if self.commands.try_send(UiCommand::Prompt(text)).is_err() {
             self.finish_turn();
-            self.entries
-                .push(Entry::Notice("没有连上 host，消息未发出".to_owned()));
+            self.timeline
+                .push_notice("没有连上 host，消息未发出".to_owned());
         }
 
         cx.notify();
@@ -937,13 +869,12 @@ impl Chat {
             })
             .is_err()
         {
-            self.entries
-                .push(Entry::Notice("没有连上 host，停不下来".to_owned()));
+            self.timeline
+                .push_notice("没有连上 host，停不下来".to_owned());
         } else {
             // 收尾还靠 `turn/end`（那一帧到了才真正回空闲），但先给一条回声，
             // 不然点了「停」界面上什么都没变。
-            self.entries
-                .push(Entry::Notice("已请求停止本轮".to_owned()));
+            self.timeline.push_notice("已请求停止本轮".to_owned());
         }
         cx.notify();
     }
@@ -957,16 +888,122 @@ impl Chat {
 
     // ── 侧栏 ────────────────────────────────────────────────────────────
 
-    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.settings_open {
+            // 设置模式下侧栏是设置导航：工作区列表让位，避免上下文错位。
+            div()
+                .flex()
+                .flex_col()
+                .w(px(theme::SIDEBAR_W))
+                .h_full()
+                .bg(rgb(theme::BG_SIDEBAR))
+                .child(self.settings_side_top(cx))
+                .child(self.settings_side_body(cx))
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .w(px(theme::SIDEBAR_W))
+                .h_full()
+                .bg(rgb(theme::BG_SIDEBAR))
+                .child(self.side_top(cx))
+                .child(self.side_body(cx))
+                .child(self.side_foot(cx))
+                .into_any_element()
+        }
+    }
+
+    /// 设置模式的侧栏顶栏：品牌 + 收起侧栏（返回入口在侧栏正文顶部）。
+    fn settings_side_top(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
+            .flex_row()
+            .items_center()
+            .h(px(theme::BAR_H))
+            .px(px(theme::SIDE_PAD))
+            .gap_2()
+            .child(div().w(px(68.)).flex_none())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .flex_none()
+                    .child(crate::brand::lockup(15.0, theme::INK)),
+            )
+            .child(div().flex_1())
+            .child(self.side_close(cx))
+    }
+
+    /// 设置导航：按真值归属分组，只渲染非空组（#57 不摆空占位）。
+    fn settings_side_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let back = cx.entity();
+        div()
+            .id("settings-side-body")
+            .flex()
             .flex_col()
-            .w(px(theme::SIDEBAR_W))
-            .h_full()
-            .bg(rgb(theme::BG_SIDEBAR))
-            .child(self.side_top(cx))
-            .child(self.side_body(cx))
-            .child(self.side_foot())
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .px(px(theme::SIDE_PAD))
+            .pt(px(theme::SIDE_PAD))
+            .pb(px(theme::SIDE_PAD))
+            .gap_1()
+            .child(
+                div()
+                    .id("settings-side-back")
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::BG_HOVER)))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        back.update(cx, |chat, cx| {
+                            chat.settings_open = false;
+                            cx.notify();
+                        });
+                    })
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(6.))
+                    .text_size(px(theme::UI))
+                    .text_color(rgb(theme::INK_SOFT))
+                    .child("← 返回工作区"),
+            )
+            .child(
+                div()
+                    .px(px(8.))
+                    .pt(px(10.))
+                    .pb(px(4.))
+                    .text_size(px(theme::META))
+                    .text_color(rgb(theme::INK_MUTED))
+                    .child("HOST 设置"),
+            )
+            .child(
+                div()
+                    .id(ElementId::Name("settings-nav:chat".into()))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(6.))
+                    .bg(rgb(theme::BG_HOVER))
+                    .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(rgb(theme::INK)))
+                    .child(
+                        div()
+                            .text_size(px(theme::UI))
+                            .text_color(rgb(theme::INK))
+                            .child("聊天 · 详略"),
+                    ),
+            )
+            .child(
+                div()
+                    .px(px(8.))
+                    .pt(px(8.))
+                    .text_size(px(theme::META))
+                    .text_color(rgb(theme::INK_MUTED))
+                    .child("真值在 dsh profile，经 host API 读写"),
+            )
     }
 
     fn side_top(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1107,13 +1144,96 @@ impl Chat {
             body = body.child(self.workspace_row(
                 &group.key,
                 &group.label,
-                group.workspace_id.as_deref(),
+                &group.workspace_id,
                 !group.items.is_empty(),
                 cx,
             ));
             if self.expanded.get(&group.key).copied().unwrap_or(true) {
                 for session in group.items {
                     body = body.child(self.session_row(&group.key, session, cx));
+                }
+            }
+        }
+
+        // 隐藏区：移除工作区只是本地隐藏，节名留着可恢复，避免会话「静默消失」。
+        const HIDDEN_KEY: &str = "\u{0}已隐藏";
+        let hidden: Vec<(String, String)> = self
+            .registry
+            .items
+            .iter()
+            .filter(|workspace| {
+                self.prefs
+                    .hidden_workspace_ids
+                    .contains(&workspace.workspace_id)
+            })
+            .map(|workspace| (workspace.workspace_id.clone(), workspace.title.clone()))
+            .collect();
+        if !hidden.is_empty() {
+            let open = self.expanded.get(HIDDEN_KEY).copied().unwrap_or(false);
+            let arrow = if open {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            };
+            let toggle = cx.entity();
+            body = body.child(
+                div()
+                    .id(ElementId::Name("hidden:header".into()))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .mt(px(6.))
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::BG_HOVER)))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        toggle.update(cx, |chat, cx| {
+                            let next = !chat.expanded.get(HIDDEN_KEY).copied().unwrap_or(false);
+                            chat.expanded.insert(HIDDEN_KEY.to_owned(), next);
+                            cx.notify();
+                        });
+                    })
+                    .child(icon(arrow, 12.0, theme::INK_MUTED))
+                    .child(
+                        div()
+                            .text_size(px(theme::META))
+                            .text_color(rgb(theme::INK_MUTED))
+                            .child(format!("已隐藏的工作区（{}）", hidden.len())),
+                    ),
+            );
+            if open {
+                for (workspace_id, title) in hidden {
+                    let restore = cx.entity();
+                    body = body.child(
+                        div()
+                            .id(ElementId::Name(format!("hidden:{workspace_id}").into()))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .px(px(8.))
+                            .py(px(4.))
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(theme::BG_HOVER)))
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                restore.update(cx, |chat, cx| {
+                                    chat.prefs.hidden_workspace_ids.remove(&workspace_id);
+                                    let _ = chat
+                                        .commands
+                                        .try_send(UiCommand::SaveSidebarPrefs(chat.prefs.clone()));
+                                    cx.notify();
+                                });
+                            })
+                            .child(
+                                div()
+                                    .text_size(px(theme::UI))
+                                    .text_color(rgb(theme::INK_SOFT))
+                                    .child(title),
+                            ),
+                    );
                 }
             }
         }
@@ -1166,49 +1286,76 @@ impl Chat {
         }
     }
 
-    /// 侧栏分组：**已注册的工作区**（按注册表顺序）在前，剩下的会话归到「未分组」。
-    ///
-    /// 之前是按会话 `cwd` 现算分组，目录一旦注册就不受注册表影响——那样
-    /// `workspace/delete` 删了也不会在界面上消失。现在分组的「有哪些组」由
-    /// `workspace/follow` 决定，`cwd` 只用来把会话放进对应的组；
-    /// 删掉注册后它的会话落到「未分组」，与 host 语义一致（目录与会话都还在）。
+    /// 侧栏分组：按 host 账本 + 客户端历史覆盖归属；只列工作区，没有
+    /// 「未分组」组，隐藏工作区与无归属会话都不显示。
     fn workspace_groups(&self) -> Vec<SideGroup<'_>> {
-        let mut visible: Vec<&SessionInfo> = self
-            .sessions
-            .iter()
-            // 空白会话只留当前这一条（官方 `pinCurrentBlank` 的语义）：
-            // 每次启动都会建一个新的空白会话，全列出来就是一片「新会话」。
-            .filter(|session| !session.blank || session.id == self.active_session)
-            // 归档的不进树：它们在下面的「已归档」里。
-            .filter(|session| !self.registry.is_archived(&session.id))
-            .collect();
-
-        let mut groups: Vec<SideGroup<'_>> = Vec::new();
-        for workspace in &self.registry.items {
-            let (mine, rest): (Vec<&SessionInfo>, Vec<&SessionInfo>) = visible
-                .into_iter()
-                .partition(|session| same_path(&session.cwd, &workspace.path));
-            visible = rest;
-            let mut items = mine;
+        group_plan(
+            &self.sessions,
+            &self.registry,
+            &self.prefs,
+            &self.active_session,
+        )
+        .into_iter()
+        .map(|(key, label, workspace_id, ids)| {
+            let mut items: Vec<&SessionInfo> = ids
+                .iter()
+                .filter_map(|id| self.sessions.iter().find(|session| &session.id == id))
+                .collect();
             items.sort_by_key(|item| std::cmp::Reverse(item.updated_at));
-            groups.push(SideGroup {
-                key: workspace.path.clone(),
-                label: workspace.title.clone(),
-                workspace_id: Some(workspace.workspace_id.clone()),
+            SideGroup {
+                key,
+                label,
+                workspace_id,
                 items,
-            });
+            }
+        })
+        .collect()
+    }
+
+    /// 把老客户端用 cwd-only 建出来、host 账本里没有的会话收进本地覆盖。
+    ///
+    /// 只在「不属于任何账本/覆盖、且 cwd 命中某个工作区」时收养；已经被别组
+    /// 记账的会话不会被重复挂到第二组。cwd 只在这里做一次性启发，分组本身
+    /// 一律走账本。
+    fn adopt_legacy_sessions(&mut self, cx: &mut Context<Self>) {
+        let registry = &self.registry;
+        let sessions = &self.sessions;
+        let prefs = &mut self.prefs;
+        let mut owned: HashSet<String> = HashSet::new();
+        for workspace in &registry.items {
+            owned.extend(workspace.session_ids.iter().cloned());
+        }
+        for ids in prefs.adopted.values() {
+            owned.extend(ids.iter().cloned());
         }
 
-        if !visible.is_empty() {
-            visible.sort_by_key(|item| std::cmp::Reverse(item.updated_at));
-            groups.push(SideGroup {
-                key: "\u{0}未分组".to_owned(),
-                label: "未分组".to_owned(),
-                workspace_id: None,
-                items: visible,
-            });
+        let mut changed = false;
+        for workspace in &registry.items {
+            if prefs.hidden_workspace_ids.contains(&workspace.workspace_id) {
+                continue;
+            }
+            let adopted = prefs
+                .adopted
+                .entry(workspace.workspace_id.clone())
+                .or_default();
+            for session in sessions {
+                if session.blank || registry.is_archived(&session.id) || owned.contains(&session.id)
+                {
+                    continue;
+                }
+                if same_path(&session.cwd, &workspace.path) {
+                    adopted.push(session.id.clone());
+                    owned.insert(session.id.clone());
+                    changed = true;
+                }
+            }
         }
-        groups
+        if changed {
+            let _ = self
+                .commands
+                .try_send(UiCommand::SaveSidebarPrefs(self.prefs.clone()));
+            cx.notify();
+        }
     }
 
     /// 「Workspaces」标题行：右侧加号在当前工作区新建会话。
@@ -1235,15 +1382,12 @@ impl Chat {
             )
     }
 
-    /// 工作区行。
-    ///
-    /// `workspace_id` 只有已注册的工作区才有；「未分组」传 `None`，
-    /// 于是它既不能新建会话（没有注册就没有固定 cwd），也不能被删。
+    /// 工作区行：侧栏只有已注册的工作区，每行都有 id，既能建会话也能移除。
     fn workspace_row(
         &self,
         cwd: &str,
         label: &str,
-        workspace_id: Option<&str>,
+        workspace_id: &str,
         has_sessions: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -1254,7 +1398,8 @@ impl Chat {
         let create = entity.clone();
         let remove = entity.clone();
         let create_cwd = cwd.to_owned();
-        let remove_id = workspace_id.map(|id| id.to_owned());
+        let remove_id = workspace_id.to_owned();
+        let create_workspace_id = remove_id.clone();
         let arrow = if expanded || !has_sessions {
             IconName::ChevronDown
         } else {
@@ -1291,53 +1436,52 @@ impl Chat {
             )
             .child(div().flex_1());
 
-        if let Some(workspace_id) = remove_id {
-            if self.pending_delete.as_deref() == Some(workspace_id.as_str()) {
-                // 二次确认：就地把两枚图标换成「取消 / 移除」，不进对话框。
-                // 删除只动注册（目录、会话都在），所以确认文案不必吓人。
-                row = row.child(self.confirm_bar(
-                    "ws-delete",
-                    &workspace_id,
-                    ConfirmKind::WorkspaceDelete,
-                    cx,
-                ));
-            } else {
-                // hover 才出现的两枚小图标：新建会话 / 移除注册。
-                row = row
-                    .child(
-                        div()
-                            .cursor_pointer()
-                            .opacity(0.)
-                            .group_hover("workspace-row", |style| style.opacity(1.))
-                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                create.update(cx, |chat, cx| {
-                                    let _ = chat.commands.try_send(UiCommand::NewSession {
-                                        cwd: create_cwd.clone(),
-                                    });
-                                    cx.notify();
+        if self.pending_delete.as_deref() == Some(remove_id.as_str()) {
+            // 二次确认：就地把两枚图标换成「取消 / 移除」，不进对话框。
+            // 移除只动本地显示（目录、会话都在），所以确认文案不必吓人。
+            row = row.child(self.confirm_bar(
+                "ws-delete",
+                &remove_id,
+                ConfirmKind::WorkspaceDelete,
+                cx,
+            ));
+        } else {
+            // hover 才出现的两枚小图标：新建会话 / 移除工作区。
+            row = row
+                .child(
+                    div()
+                        .cursor_pointer()
+                        .opacity(0.)
+                        .group_hover("workspace-row", |style| style.opacity(1.))
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            create.update(cx, |chat, cx| {
+                                let _ = chat.commands.try_send(UiCommand::NewSession {
+                                    cwd: create_cwd.clone(),
+                                    workspace_id: create_workspace_id.clone(),
                                 });
-                                // 不让点图标同时把行展开/收起。
-                                cx.stop_propagation();
-                            })
-                            .child(icon(IconName::Plus, 12.0, theme::INK_MUTED)),
-                    )
-                    .child(
-                        div()
-                            .cursor_pointer()
-                            .opacity(0.)
-                            .group_hover("workspace-row", |style| style.opacity(1.))
-                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                let id = workspace_id.clone();
-                                remove.update(cx, |chat, cx| {
-                                    // 第一下只进确认态。
-                                    chat.pending_delete = Some(id);
-                                    cx.notify();
-                                });
-                                cx.stop_propagation();
-                            })
-                            .child(icon(IconName::Delete, 12.0, theme::INK_MUTED)),
-                    );
-            }
+                                cx.notify();
+                            });
+                            // 不让点图标同时把行展开/收起。
+                            cx.stop_propagation();
+                        })
+                        .child(icon(IconName::Plus, 12.0, theme::INK_MUTED)),
+                )
+                .child(
+                    div()
+                        .cursor_pointer()
+                        .opacity(0.)
+                        .group_hover("workspace-row", |style| style.opacity(1.))
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            let id = remove_id.clone();
+                            remove.update(cx, |chat, cx| {
+                                // 第一下只进确认态。
+                                chat.pending_delete = Some(id);
+                                cx.notify();
+                            });
+                            cx.stop_propagation();
+                        })
+                        .child(icon(IconName::Delete, 12.0, theme::INK_MUTED)),
+                );
         }
 
         row
@@ -1428,11 +1572,13 @@ impl Chat {
     fn confirm_pending(&mut self, kind: ConfirmKind, id: String) {
         match kind {
             ConfirmKind::WorkspaceDelete => {
-                self.registry.items.retain(|item| item.workspace_id != id);
+                // 本地隐藏，不碰 host 注册与账本：重添加同一目录时会话原样回来。
+                // 注册表仍留着这条，UI 分组时按 hidden 过滤，隐藏入口也能显示标题。
+                self.prefs.hidden_workspace_ids.insert(id);
                 self.pending_delete = None;
                 let _ = self
                     .commands
-                    .try_send(UiCommand::DeleteWorkspace { workspace_id: id });
+                    .try_send(UiCommand::SaveSidebarPrefs(self.prefs.clone()));
             }
             ConfirmKind::SessionArchive => {
                 self.archive_session(id);
@@ -1530,7 +1676,7 @@ impl Chat {
                     {
                         chat.active_session = id.clone();
                         chat.finish_turn();
-                        chat.fold = AssistantStreamFold::new();
+                        chat.timeline = ChatTimeline::new();
                         cx.notify();
                     }
                 });
@@ -1683,7 +1829,7 @@ impl Chat {
                     {
                         chat.active_session = open_id.clone();
                         chat.finish_turn();
-                        chat.fold = AssistantStreamFold::new();
+                        chat.timeline = ChatTimeline::new();
                         cx.notify();
                     }
                 });
@@ -1715,8 +1861,9 @@ impl Chat {
             )
     }
 
-    fn side_foot(&self) -> impl IntoElement {
+    fn side_foot(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (tone, label) = host_status(self.host_state);
+        let settings = cx.entity();
 
         div()
             .flex()
@@ -1733,14 +1880,167 @@ impl Chat {
                     .child(label),
             )
             .child(div().flex_1())
-            .child(icon(IconName::Settings, 14.0, theme::INK_MUTED))
+            .child(
+                div()
+                    .id("settings-toggle")
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::BG_HOVER)))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        settings.update(cx, |chat, cx| {
+                            chat.settings_open = !chat.settings_open;
+                            cx.notify();
+                        });
+                    })
+                    .child(icon(IconName::Settings, 14.0, theme::INK_MUTED)),
+            )
+    }
+
+    /// 最小 settings 页面：一个设置、三档取值，不摆未来项占位。
+    fn settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut segments = div().flex().flex_row().flex_1().gap_1();
+        for verbosity in ChatVerbosity::ALL {
+            let entity = cx.entity();
+            let sender = self.commands.clone();
+            let previous = self.settings.verbosity;
+            let selected = self.settings.verbosity == verbosity;
+            segments = segments.child(
+                div()
+                    .id(ElementId::Name(
+                        format!("verbosity:{}", verbosity.key()).into(),
+                    ))
+                    .flex()
+                    .flex_1()
+                    .justify_center()
+                    .items_center()
+                    .py(px(8.))
+                    .rounded(px(6.))
+                    .bg(rgb(if selected {
+                        theme::BG_HOVER
+                    } else {
+                        theme::BG_CARD
+                    }))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::BG_HOVER)))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        let _ = sender.try_send(UiCommand::SetChatVerbosity {
+                            verbosity,
+                            previous,
+                        });
+                        entity.update(cx, |chat, cx| {
+                            chat.apply_verbosity(verbosity);
+                            chat.settings_error = None;
+                            chat.settings_saved = false;
+                            cx.notify();
+                        });
+                    })
+                    .child(
+                        div()
+                            .text_size(px(theme::UI))
+                            .text_color(rgb(if selected {
+                                theme::INK
+                            } else {
+                                theme::INK_SOFT
+                            }))
+                            .child(verbosity.label()),
+                    ),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
+            .child(
+                div()
+                    .id("settings-scroll")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .w_full()
+                    .max_w(px(theme::CONTENT_W))
+                    .mx_auto()
+                    .px(px(theme::GUTTER))
+                    .py(px(theme::GUTTER))
+                    .gap_6()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(theme::BODY))
+                                    .text_color(rgb(theme::INK))
+                                    .child("聊天"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(theme::META))
+                                    .text_color(rgb(theme::INK_MUTED))
+                                    .child("全局详略；控制 reasoning 与工具过程的默认显示"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .p(px(4.))
+                            .rounded(px(10.))
+                            .bg(rgb(theme::BG_CARD))
+                            .border_1()
+                            .border_color(rgb(theme::BG_CARD_EDGE))
+                            .child(segments),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme::META))
+                            .text_color(rgb(theme::INK_SOFT))
+                            .child(self.settings.verbosity.description()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme::META))
+                            .text_color(rgb(theme::INK_MUTED))
+                            .child("真值：~/.dsh/profiles/cowork · ui-chat.transcriptView（经 host API 读写）"),
+                    )
+                    .child(if let Some(error) = self.settings_error.as_deref() {
+                        div()
+                            .text_size(px(theme::META))
+                            .text_color(rgb(theme::INK_SOFT))
+                            .child(format!("保存失败：{error}"))
+                            .into_any_element()
+                    } else if self.settings_saved {
+                        div()
+                            .text_size(px(theme::META))
+                            .text_color(rgb(theme::INK_SOFT))
+                            .child("已保存到 host profile")
+                            .into_any_element()
+                    } else {
+                        div().into_any_element()
+                    }),
+            )
+    }
+
+    /// 应用档位只影响默认值；已展开的会话内覆盖清掉，让新档位立即生效。
+    /// 真值由 host 回送，这里只更新内存镜像。
+    fn apply_verbosity(&mut self, verbosity: ChatVerbosity) {
+        self.settings.verbosity = verbosity;
+        self.tool_open.clear();
+        self.reasoning_open.clear();
+        self.open_groups.clear();
     }
 
     // ── 主区 ────────────────────────────────────────────────────────────
 
     fn main(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // 还没选工作区 / 没有会话：主区是空状态，不是聊天区。
-        let body = if self.active_session.is_empty() {
+        let body = if self.settings_open {
+            self.settings_page(cx).into_any_element()
+        } else if self.active_session.is_empty() {
             self.empty_state(cx).into_any_element()
         } else {
             div()
@@ -1771,7 +2071,7 @@ impl Chat {
             .bg(rgb(theme::BG_MAIN))
             .child(column);
 
-        if self.right_panel_open && !self.active_session.is_empty() {
+        if self.right_panel_open && !self.settings_open && !self.active_session.is_empty() {
             main = main.child(self.right_panel());
         }
 
@@ -1781,7 +2081,7 @@ impl Chat {
     /// 没有会话时的主区：像官方 desktop 的空状态，直接列出已注册的工作区。
     ///
     /// 选一个工作区就在那个目录下建会话；没有工作区就只留「添加工作区…」。
-    /// 这样新会话不会落进「未分组」，cwd 也不再由启动目录 / 家目录决定。
+    /// 这样新会话一定建在明确选定的工作区里，cwd 也不再由启动目录 / 家目录决定。
     fn empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
         let mut list = div()
@@ -1796,7 +2096,15 @@ impl Chat {
             .border_color(rgb(theme::BG_CARD_EDGE));
 
         for workspace in &self.registry.items {
+            if self
+                .prefs
+                .hidden_workspace_ids
+                .contains(&workspace.workspace_id)
+            {
+                continue;
+            }
             let path = workspace.path.clone();
+            let workspace_id = workspace.workspace_id.clone();
             let press = entity.clone();
             let tone = theme::INK_SOFT;
             list = list.child(
@@ -1815,9 +2123,10 @@ impl Chat {
                     .hover(|style| style.bg(rgb(theme::BG_HOVER)))
                     .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                         press.update(cx, |chat, cx| {
-                            let _ = chat
-                                .commands
-                                .try_send(UiCommand::NewSession { cwd: path.clone() });
+                            let _ = chat.commands.try_send(UiCommand::NewSession {
+                                cwd: path.clone(),
+                                workspace_id: workspace_id.clone(),
+                            });
                             cx.notify();
                         });
                     })
@@ -1867,7 +2176,13 @@ impl Chat {
                 ),
         );
 
-        let hint = if self.registry.items.is_empty() {
+        let has_visible = self.registry.items.iter().any(|workspace| {
+            !self
+                .prefs
+                .hidden_workspace_ids
+                .contains(&workspace.workspace_id)
+        });
+        let hint = if !has_visible {
             "添加一个目录开始"
         } else {
             "选一个工作区开始新会话"
@@ -2015,26 +2330,23 @@ impl Chat {
             .max_w(px(theme::CONTENT_W))
             .gap_3();
 
-        // 过程组是**渲染期派生**的，不存进模型：连续的工具行归一组，
-        // 中间只要有一句助手正文就断开。切模式只是换一种画法，数据不重复。
+        // 行来自时间线投影；过程组是渲染期派生的，不回写投影状态。
+        // 详略档位只改显示默认值，不改投影：切档不会丢会话内容。
+        let rows = self.timeline.rows();
         let mut index = 0;
-        for run in tool_runs(&self.entries) {
+        for run in process_runs(&rows) {
             while index < run.start {
-                column = column.child(render_entry(&self.entries[index]));
+                column = column.child(render_row(&rows[index]));
                 index += 1;
             }
-            column = column.child(self.tool_group(&self.entries[run.clone()], cx));
+            column = column.child(self.process_group(&rows[run.clone()], cx));
             index = run.end;
         }
-        while index < self.entries.len() {
-            column = column.child(render_entry(&self.entries[index]));
+        while index < rows.len() {
+            column = column.child(render_row(&rows[index]));
             index += 1;
         }
 
-        let live = self.fold.text();
-        if !live.is_empty() {
-            column = column.child(crate::markdown::text(self.live_id(), &live));
-        }
         if let Some(status) = self.running_status() {
             column = column.child(status);
         }
@@ -2050,106 +2362,166 @@ impl Chat {
         )
     }
 
-    /// 一段连续的工具调用：组头（可点开合）+ 可选的行列表。
-    fn tool_group(&self, calls: &[Entry], cx: &mut Context<Self>) -> Div {
-        let mut tools: Vec<&ToolCall> = Vec::new();
-        for entry in calls {
-            if let Entry::Tool(call) = entry {
-                tools.push(call);
-            }
-        }
-        let Some(first) = tools.first() else {
+    /// 一段连续的过程行（reasoning + 工具）：组头 + 可选的行列表。
+    fn process_group(&self, rows: &[TimelineRow], cx: &mut Context<Self>) -> Div {
+        let Some(first) = rows.first() else {
             return div();
         };
-        let key = first.id.clone();
-        let running_turn = self.phase.is_busy();
-        let open = self
-            .open_groups
-            .get(&key)
-            .copied()
-            .unwrap_or_else(|| self.view.group_body_open(running_turn))
-            || self.debug_tools_open;
+        let key = row_render_id(first).label();
+        let policy = self.settings.verbosity.policy();
+        let running_turn = process_group_running(rows, self.phase.is_busy());
+        let header_visible = policy.group_header_visible(running_turn);
+        let open = !header_visible
+            || self.debug_tools_open
+            || self
+                .open_groups
+                .get(&key)
+                .copied()
+                .unwrap_or_else(|| policy.group_body_open(running_turn));
 
-        let entity = cx.entity();
-        let toggle = entity.clone();
-        let header = div()
-            .id("group-header")
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .py(px(2.))
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(theme::BG_HOVER)))
-            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                toggle.update(cx, |chat, cx| {
-                    let next = !chat
-                        .open_groups
-                        .get(&key)
-                        .copied()
-                        .unwrap_or_else(|| chat.view.group_body_open(chat.phase.is_busy()));
-                    chat.open_groups.insert(key.clone(), next);
-                    cx.notify();
-                });
-            })
-            .child(icon(
-                if open {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                },
-                12.0,
-                theme::INK_MUTED,
-            ))
-            .child(
-                div()
-                    .text_size(px(theme::META))
-                    .text_color(rgb(theme::INK_SOFT))
-                    .child(group_label(self.view, &tools, running_turn)),
-            )
-            .child(div().flex_1());
-
-        // 右侧：当前模式，点一下换下一档（还没有设置面板，就近放这里）。
-        let switch = entity.clone();
-        let mode = TranscriptView::label(self.view);
-        let header = header.child(
-            div()
-                .id("group-view")
-                .text_size(px(theme::META))
-                .text_color(rgb(theme::INK_MUTED))
+        let mut group = div().flex().flex_col().gap_1();
+        if header_visible {
+            let toggle = cx.entity();
+            let toggle_key = key.clone();
+            let header = div()
+                .id(format!("group-header:{key}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .py(px(2.))
                 .cursor_pointer()
-                .hover(|style| style.text_color(rgb(theme::INK_SOFT)))
+                .hover(|style| style.bg(rgb(theme::BG_HOVER)))
                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                    switch.update(cx, |chat, cx| {
-                        chat.view = chat.view.next();
+                    toggle.update(cx, |chat, cx| {
+                        let policy = chat.settings.verbosity.policy();
+                        let next = !chat
+                            .open_groups
+                            .get(&toggle_key)
+                            .copied()
+                            .unwrap_or_else(|| policy.group_body_open(running_turn));
+                        chat.open_groups.insert(toggle_key.clone(), next);
                         cx.notify();
                     });
                 })
-                .child(mode),
-        );
+                .child(icon(
+                    if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    },
+                    12.0,
+                    theme::INK_MUTED,
+                ))
+                .child(
+                    div()
+                        .text_size(px(theme::META))
+                        .text_color(rgb(theme::INK_SOFT))
+                        .child(group_label(policy, rows, running_turn)),
+                )
+                .child(div().flex_1());
+            group = group.child(header);
+        }
 
-        let mut group = div().flex().flex_col().gap_1().child(header);
         if open {
-            let mut rows = div().flex().flex_col().gap_1().pl(px(16.));
-            for call in &tools {
-                rows = rows.child(self.tool_row(call, cx));
+            let mut body = div().flex().flex_col().gap_1().pl(px(16.));
+            for row in rows {
+                body = match row {
+                    TimelineRow::Reasoning {
+                        id,
+                        text,
+                        streaming,
+                    } => body.child(self.reasoning_row(id, text, *streaming, cx)),
+                    TimelineRow::Tool(view) => body.child(self.tool_row(view, cx)),
+                    other => body.child(render_row(other)),
+                };
             }
-            group = group.child(rows);
+            group = group.child(body);
         }
         group
     }
 
-    /// 一行工具调用：图标 + 名字 + 摘要 + 后缀；点开看正文。
-    fn tool_row(&self, call: &ToolCall, cx: &mut Context<Self>) -> Div {
-        // 调试开关把正文全展开：合成点击在本机只有一半能落上屏，
-        // 验收排版时用它代替手点（`DSH_DEBUG_TOOL_OPEN=1`）。
-        let open = self.debug_tools_open || self.open_tools.contains(&call.id);
+    /// 一行 reasoning：默认收起，按档位给不给预览；正文点开后才是纯文本。
+    fn reasoning_row(
+        &self,
+        id: &RenderId,
+        text: &str,
+        streaming: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let policy = self.settings.verbosity.policy();
+        let key = id.label();
+        let open = self.debug_tools_open || self.reasoning_open.get(&key).copied().unwrap_or(false);
+        let preview = reasoning_preview(text, streaming, policy);
         let entity = cx.entity();
-        let id = call.id.clone();
-        let stroke = match call.status {
+        let toggle_key = key.clone();
+
+        let row = div()
+            .id(format!("reasoning-row:{key}"))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                entity.update(cx, |chat, cx| {
+                    let next = !chat
+                        .reasoning_open
+                        .get(&toggle_key)
+                        .copied()
+                        .unwrap_or(false);
+                    chat.reasoning_open.insert(toggle_key.clone(), next);
+                    cx.notify();
+                });
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(icon(
+                        if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        },
+                        12.0,
+                        theme::INK_MUTED,
+                    ))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(theme::META))
+                            .text_color(rgb(theme::INK_MUTED))
+                            .child("思考"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .text_size(px(theme::META))
+                            .text_color(rgb(theme::INK_MUTED))
+                            .child(preview),
+                    ),
+            );
+
+        if !open {
+            return row.into_any_element();
+        }
+        row.child(crate::markdown::text(id.clone(), text, TextRole::Reasoning))
+            .into_any_element()
+    }
+
+    /// 一行工具调用：家族图标 + 名字 + 标题 + 后缀；点开看审计字段与结果。
+    fn tool_row(&self, view: &ToolView, cx: &mut Context<Self>) -> Div {
+        // 单个工具正文永远手动展开；档位只决定过程组的默认开合。
+        let open = self.debug_tools_open || self.tool_open.get(&view.id).copied().unwrap_or(false);
+        let entity = cx.entity();
+        let id = view.id.clone();
+        let stroke = match view.status {
             ToolStatus::Running => theme::INK_SOFT,
             ToolStatus::Ok => theme::INK_MUTED,
-            // 失败不靠颜色：fx-ui chrome 零彩色，用字色 + 后缀「失败」表达。
             ToolStatus::Error => theme::INK,
         };
 
@@ -2161,19 +2533,20 @@ impl Chat {
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 entity.update(cx, |chat, cx| {
-                    if !chat.open_tools.remove(&id) {
-                        chat.open_tools.insert(id.clone());
-                    }
+                    chat.tool_open.insert(
+                        id.clone(),
+                        !chat.tool_open.get(&id).copied().unwrap_or(false),
+                    );
                     cx.notify();
                 });
             })
-            .child(icon(tool_icon(&call.name), 13.0, theme::INK_MUTED))
+            .child(icon(tool_icon(view.family), 13.0, theme::INK_MUTED))
             .child(
                 div()
                     .flex_shrink_0()
                     .text_size(px(theme::META))
                     .text_color(rgb(theme::INK_MUTED))
-                    .child(call.name.clone()),
+                    .child(view.name.clone()),
             )
             .child(
                 div()
@@ -2182,26 +2555,30 @@ impl Chat {
                     .overflow_hidden()
                     .text_size(px(theme::META))
                     .text_color(rgb(stroke))
-                    .child(call.summary.clone()),
+                    .child(view.title.clone()),
             )
             .child(
                 div()
                     .flex_shrink_0()
                     .text_size(px(theme::META))
-                    .text_color(rgb(match call.status {
+                    .text_color(rgb(match view.status {
                         ToolStatus::Error => theme::INK,
                         _ => theme::INK_MUTED,
                     }))
-                    .child(tool_suffix(call)),
+                    .child(tool_suffix(view)),
             );
 
-        if !open || call.detail.is_empty() {
+        if !open {
+            return row;
+        }
+        let body = tool_body(view);
+        if body.is_empty() {
             return row;
         }
 
-        // 输出可能上千行：正文之外再限一次行数，免得展开一下就把窗口摸掉。
+        // 结果可能有上千行：展开区再限一次行数，避免把视口冲垮。
         const MAX_LINES: usize = 24;
-        let lines: Vec<&str> = call.detail.lines().collect();
+        let lines: Vec<&str> = body.lines().collect();
         let shown = if lines.len() > MAX_LINES {
             format!(
                 "{}\n…（共 {} 行，只显示前 {MAX_LINES} 行）",
@@ -2209,12 +2586,12 @@ impl Chat {
                 lines.len()
             )
         } else {
-            call.detail.clone()
+            body
         };
 
         div().flex().flex_col().gap_1().child(row).child(
             div()
-                .id(ElementId::Name(format!("tool-detail:{}", call.id).into()))
+                .id(ElementId::Name(format!("tool-detail:{}", view.id).into()))
                 .pl(px(21.))
                 .pr(px(8.))
                 .py(px(6.))
@@ -3044,9 +3421,9 @@ impl Render for Chat {
     }
 }
 
-fn render_entry(entry: &Entry) -> AnyElement {
-    match entry {
-        Entry::User { text, .. } => div()
+fn render_row(row: &TimelineRow) -> AnyElement {
+    match row {
+        TimelineRow::User { text, .. } => div()
             .flex()
             .flex_row()
             .gap_2()
@@ -3054,66 +3431,81 @@ fn render_entry(entry: &Entry) -> AnyElement {
             .child(div().text_color(rgb(theme::INK_MUTED)).child("›"))
             .child(div().child(text.clone()))
             .into_any_element(),
-        // 助手正文是唯一解析 markdown 的地方（理由见 `markdown` 模块头注释）。
-        Entry::Assistant { id, text } => crate::markdown::text(*id, text).into_any_element(),
-        Entry::Notice(text) => div()
+        TimelineRow::Assistant { id, text, .. } => {
+            crate::markdown::text(id.clone(), text, TextRole::Assistant).into_any_element()
+        }
+        TimelineRow::Reasoning { id, text, .. } => {
+            crate::markdown::text(id.clone(), text, TextRole::Reasoning).into_any_element()
+        }
+        TimelineRow::Notice { text, .. } => div()
             .text_size(px(theme::META))
             .text_color(rgb(theme::INK_MUTED))
             .child(text.clone())
             .into_any_element(),
         // 工具行走 `Chat::tool_group`（要拿 `cx` 接点击），不会到这里。
-        Entry::Tool(call) => div()
+        TimelineRow::Tool(view) => div()
             .text_size(px(theme::META))
             .text_color(rgb(theme::INK_MUTED))
-            .child(call.name.clone())
+            .child(view.name.clone())
             .into_any_element(),
     }
 }
 
-/// 组头文案：类别摘要 + 计数，运行中再加一句实时提示。
-///
-/// 官方口径：组头只给类别，不给逐个名字（避免组头比正文还长）。
-fn group_label(view: TranscriptView, tools: &[&ToolCall], running: bool) -> String {
+/// 组头文案：类别摘要，运行中按档位加一句实时提示。
+fn group_label(policy: RenderPolicy, rows: &[TimelineRow], running: bool) -> String {
+    let tools: Vec<&ToolView> = rows
+        .iter()
+        .filter_map(|row| match row {
+            TimelineRow::Tool(view) => Some(view),
+            _ => None,
+        })
+        .collect();
     let mut kinds: Vec<&str> = Vec::new();
-    for call in tools {
-        let kind = tool_kind(&call.name);
+    for tool in &tools {
+        let kind = tool.family.category();
         if !kinds.contains(&kind) {
             kinds.push(kind);
         }
     }
     kinds.truncate(3);
-    let summary = kinds.join(" · ");
-    let count = tools.len();
-    match view {
-        // 简洁：只给类别。
-        TranscriptView::Compact => format!("{summary} · {count}"),
-        // 标准：运行中的组补一句「正在跑哪一个」。
-        TranscriptView::Standard | TranscriptView::Detailed => {
-            if running
-                && let Some(last) = tools.last()
-                && last.status == ToolStatus::Running
-            {
-                return format!("{summary} · {count} · 正在跑 {}", last.name);
-            }
-            format!("{summary} · {count}")
-        }
+    let summary = if kinds.is_empty() {
+        if running { "分析中" } else { "分析完成" }.to_owned()
+    } else {
+        kinds.join(" · ")
+    };
+    if policy.show_running_hint(running)
+        && let Some(last) = tools.last()
+        && last.status == ToolStatus::Running
+    {
+        return format!("{summary} · 正在跑 {}", last.name);
+    }
+    summary
+}
+
+/// 行的稳定渲染身份；过程组用它做会话内开合键。
+fn row_render_id(row: &TimelineRow) -> RenderId {
+    match row {
+        TimelineRow::User { id, .. }
+        | TimelineRow::Assistant { id, .. }
+        | TimelineRow::Reasoning { id, .. }
+        | TimelineRow::Notice { id, .. } => id.clone(),
+        TimelineRow::Tool(view) => RenderId::Tool(view.id.clone()),
     }
 }
 
-/// 连续工具行的区间（渲染期分组的唯一依据）。
-///
-/// 工具行只与相邻的工具行归一组：中间夹一句助手正文就断开，
-/// 所以「思考—工具—回答—工具」会得到两个组，而不是一大块。
-fn tool_runs(entries: &[Entry]) -> Vec<std::ops::Range<usize>> {
+/// 连续过程行的区间。assistant 正文 / 用户输入 / 提示都会断开过程组。
+fn process_runs(rows: &[TimelineRow]) -> Vec<std::ops::Range<usize>> {
+    let is_process =
+        |row: &TimelineRow| matches!(row, TimelineRow::Reasoning { .. } | TimelineRow::Tool(_));
     let mut runs = Vec::new();
     let mut index = 0;
-    while index < entries.len() {
-        if !matches!(entries[index], Entry::Tool(_)) {
+    while index < rows.len() {
+        if !is_process(&rows[index]) {
             index += 1;
             continue;
         }
         let start = index;
-        while index < entries.len() && matches!(entries[index], Entry::Tool(_)) {
+        while index < rows.len() && is_process(&rows[index]) {
             index += 1;
         }
         runs.push(start..index);
@@ -3121,42 +3513,115 @@ fn tool_runs(entries: &[Entry]) -> Vec<std::ops::Range<usize>> {
     runs
 }
 
-/// 工具类别（组头摘要用）。
-fn tool_kind(name: &str) -> &'static str {
-    match name {
-        "bash" | "pwsh" | "terminal_send" | "bash_persistent" => "命令",
-        "read" | "read_image" => "读取",
-        "write" | "edit" | "apply_patch" | "str_replace_editor" => "编辑",
-        "grep" | "glob" | "search" => "搜索",
-        "web_fetch" | "web_search" => "网页",
-        "office_render" | "office_convert" | "office_recalculate" => "Office",
-        "subagent" | "subagent_fork" => "子智能体",
-        _ => "工具",
-    }
+/// 这一段过程是否属于正在跑的 Turn。
+///
+/// 我们还没有完整的 turn/tail 模型，所以用封闭可观察信号：会话忙 + 本段有
+/// 流式 reasoning 或未收尾工具。历史段在忙时也不会被误判成运行中。
+fn process_group_running(rows: &[TimelineRow], session_busy: bool) -> bool {
+    session_busy
+        && rows.iter().any(|row| match row {
+            TimelineRow::Reasoning { streaming, .. } => *streaming,
+            TimelineRow::Tool(view) => view.status == ToolStatus::Running,
+            _ => false,
+        })
 }
 
-/// 工具行前缀图标（Lucide）。
-fn tool_icon(name: &str) -> IconName {
-    match name {
-        "bash" | "pwsh" | "terminal_send" | "bash_persistent" => IconName::SquareTerminal,
-        "read" | "read_image" => IconName::FileText,
-        "write" | "edit" | "apply_patch" | "str_replace_editor" => IconName::Pencil,
-        "grep" | "glob" | "search" => IconName::Search,
-        "web_fetch" | "web_search" => IconName::Globe,
+/// reasoning 折叠态的预览。
+///
+/// 流式时与官方一致：只取「首行已换行」的最后一段，未写完的单行不给预览；
+/// 已落定时 Compact 不显示预览，其余档位显示首行。正文始终是纯文本。
+fn reasoning_preview(text: &str, streaming: bool, policy: RenderPolicy) -> String {
+    if streaming {
+        let paragraphs: Vec<&str> = text.split("\n\n").collect();
+        return paragraphs
+            .into_iter()
+            .rev()
+            .find_map(|paragraph| {
+                if !paragraph.contains('\n') {
+                    return None;
+                }
+                paragraph
+                    .lines()
+                    .next()
+                    .map(|line| line.trim().to_owned())
+                    .filter(|line| !line.is_empty())
+            })
+            .unwrap_or_default();
+    }
+    if !policy.reasoning_preview {
+        return String::new();
+    }
+    text.lines()
+        .next()
+        .map(|line| line.trim().to_owned())
+        .unwrap_or_default()
+}
+
+/// 展开区正文：审计字段 + 工具结果，永远是纯文本，不解析 markdown。
+fn tool_body(view: &ToolView) -> String {
+    let mut lines: Vec<String> = view
+        .details
+        .iter()
+        .map(|detail| format!("{}: {}", detail.label, detail.value))
+        .collect();
+    match &view.result {
+        ToolResultView::None => {}
+        ToolResultView::Text { text, truncated } => {
+            lines.push(text.clone());
+            if *truncated {
+                lines.push("（输出过长，只显示前一段）".to_owned());
+            }
+        }
+        ToolResultView::Diff {
+            path,
+            added,
+            removed,
+            preview,
+        } => {
+            if !path.is_empty() {
+                lines.push(path.clone());
+            }
+            lines.push(format!("+{added} -{removed}"));
+            lines.push(preview.clone());
+        }
+        ToolResultView::Error { text } => lines.push(format!("失败: {text}")),
+        ToolResultView::Preview { title, text } => {
+            lines.push(title.clone());
+            lines.push(text.clone());
+        }
+    }
+    lines.join("\n").trim().to_owned()
+}
+
+/// 工具行前缀图标（Lucide）；映射家族而非工具名，未知工具也能稳定归类。
+fn tool_icon(family: ToolFamily) -> IconName {
+    match family {
+        ToolFamily::Shell => IconName::SquareTerminal,
+        ToolFamily::FileRead => IconName::FileText,
+        ToolFamily::FileWrite => IconName::Pencil,
+        ToolFamily::Search => IconName::Search,
+        ToolFamily::Web => IconName::Globe,
         _ => IconName::Wrench,
     }
 }
 
-/// 行尾后缀：状态 + 输出长度。
-fn tool_suffix(call: &ToolCall) -> String {
+/// 行尾后缀：状态 + 输出长度 + 可选耗时。
+fn tool_suffix(view: &ToolView) -> String {
     let mut parts: Vec<String> = Vec::new();
-    match call.status {
+    match view.status {
         ToolStatus::Running => parts.push("运行中".to_owned()),
         ToolStatus::Error => parts.push("失败".to_owned()),
         ToolStatus::Ok => {}
     }
-    if call.detail_chars > 0 {
-        parts.push(format!("{} 字", call.detail_chars));
+    if view.output_chars > 0 {
+        parts.push(format!("{} 字", view.output_chars));
+    }
+    if let Some(ms) = view.elapsed_ms {
+        parts.push(if ms >= 1000 {
+            format!("{:.1}s", ms as f64 / 1000.0)
+        } else {
+            format!("{ms}ms")
+        });
     }
     parts.join(" · ")
 }
@@ -3336,14 +3801,14 @@ impl ConfirmKind {
     }
 }
 
-/// 侧栏的一个分组：一个已注册工作区，或「未分组」。
+/// 侧栏的一个分组：一个已注册工作区。
 struct SideGroup<'a> {
     /// 展开状态与行 id 的键（工作区用 path）。
     key: String,
     /// 显示名。
     label: String,
-    /// 工作区 id；「未分组」为 `None`。
-    workspace_id: Option<String>,
+    /// 工作区 id。
+    workspace_id: String,
     /// 组内会话，按更新时间倒序。
     items: Vec<&'a SessionInfo>,
 }
@@ -3359,6 +3824,69 @@ fn same_path(left: &str, right: &str) -> bool {
         strip(right.trim_end_matches('/')),
     );
     left == right
+}
+
+/// 纯计算侧栏分组，便于单测。返回 `(key, label, workspace_id, [session_id])`。
+///
+/// 归属真源是账本（host 的 `session_ids` + 本地历史覆盖）。侧栏只显示工作区：
+/// 隐藏工作区的会话连同整组消失；账本里没有归属的历史会话也不在这里出现
+/// （它们仍在 host 上，可通过搜索访问）。
+fn group_plan(
+    sessions: &[SessionInfo],
+    registry: &WorkspaceRegistry,
+    prefs: &SidebarPrefs,
+    active_session: &str,
+) -> Vec<(String, String, String, Vec<String>)> {
+    // session id -> workspace id；隐藏组的成员单独记，直接跳过。
+    let mut owner: HashMap<&str, &str> = HashMap::new();
+    let mut hidden_ids: HashSet<&str> = HashSet::new();
+    for workspace in &registry.items {
+        let hidden = prefs.hidden_workspace_ids.contains(&workspace.workspace_id);
+        let ledger = workspace.session_ids.iter().map(String::as_str);
+        let adopted = prefs
+            .adopted
+            .get(&workspace.workspace_id)
+            .map(|ids| ids.iter().map(String::as_str))
+            .into_iter()
+            .flatten();
+        for id in ledger.chain(adopted) {
+            if hidden {
+                hidden_ids.insert(id);
+            } else {
+                owner.insert(id, workspace.workspace_id.as_str());
+            }
+        }
+    }
+
+    let mut buckets: HashMap<&str, Vec<&SessionInfo>> = HashMap::new();
+    for session in sessions.iter().filter(|session| {
+        (!session.blank || session.id == active_session) && !registry.is_archived(&session.id)
+    }) {
+        if hidden_ids.contains(session.id.as_str()) {
+            continue;
+        }
+        if let Some(workspace_id) = owner.get(session.id.as_str()) {
+            buckets.entry(workspace_id).or_default().push(session);
+        }
+    }
+
+    let mut plan = Vec::new();
+    for workspace in &registry.items {
+        if prefs.hidden_workspace_ids.contains(&workspace.workspace_id) {
+            continue;
+        }
+        let mut items = buckets
+            .remove(workspace.workspace_id.as_str())
+            .unwrap_or_default();
+        items.sort_by_key(|item| std::cmp::Reverse(item.updated_at));
+        plan.push((
+            workspace.path.clone(),
+            workspace.title.clone(),
+            workspace.workspace_id.clone(),
+            items.into_iter().map(|item| item.id.clone()).collect(),
+        ));
+    }
+    plan
 }
 
 /// 把 home 前缀缩成 `~`，与设计稿的路径行一致。
@@ -3393,10 +3921,13 @@ fn short_id(session: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ModelGroup, PullRow, SelectedModel, TranscriptView, format_tokens, host_status, leaf,
-        model_menu_rows, short_id, tool_runs,
+        ChatVerbosity, ModelGroup, PullRow, SelectedModel, format_tokens, group_plan, host_status,
+        leaf, model_menu_rows, process_group_running, process_runs, reasoning_preview, short_id,
     };
-    use crate::{HostLifecycle, ModelOption};
+    use crate::{HostLifecycle, ModelOption, SessionInfo, SidebarPrefs};
+    use dsh_protocol::workspace::{WorkspaceRegistry, WorkspaceView};
+    use dsh_protocol::{TimelineRow, ToolFamily, ToolResultView, ToolView};
+    use std::collections::{HashMap, HashSet};
 
     fn group(provider: &str, models: &[(&str, &str)]) -> ModelGroup {
         ModelGroup {
@@ -3495,53 +4026,198 @@ mod tests {
         assert_eq!(leaf("/"), "/");
     }
 
-    fn tool(id: &str) -> dsh_protocol::transcript::Entry {
-        dsh_protocol::transcript::Entry::Tool(dsh_protocol::transcript::ToolCall {
+    fn tool(id: &str) -> TimelineRow {
+        TimelineRow::Tool(ToolView {
             id: id.to_owned(),
             name: "bash".to_owned(),
+            family: ToolFamily::Shell,
+            title: "ls".to_owned(),
             summary: "ls".to_owned(),
+            details: Vec::new(),
             status: dsh_protocol::transcript::ToolStatus::Ok,
-            detail: String::new(),
-            detail_chars: 0,
+            output_chars: 0,
+            elapsed_ms: None,
+            result: ToolResultView::None,
         })
     }
 
-    fn text(body: &str) -> dsh_protocol::transcript::Entry {
-        dsh_protocol::transcript::Entry::Assistant {
-            id: dsh_protocol::transcript::MessageId::Turn { turn: 1, step: 1 },
+    fn text(body: &str) -> TimelineRow {
+        TimelineRow::Assistant {
+            id: dsh_protocol::RenderId::Assistant {
+                id: dsh_protocol::MessageId::Turn { turn: 1, step: 1 },
+                index: 0,
+            },
             text: body.to_owned(),
+            streaming: false,
         }
     }
 
-    /// 只有**相邻**的工具行才归一组：中间夹助手正文就断开。
+    fn reasoning(body: &str) -> TimelineRow {
+        TimelineRow::Reasoning {
+            id: dsh_protocol::RenderId::Reasoning {
+                id: dsh_protocol::MessageId::Turn { turn: 1, step: 1 },
+                index: 0,
+            },
+            text: body.to_owned(),
+            streaming: false,
+        }
+    }
+
+    /// 只有**相邻**的过程行才归一组：中间夹助手正文就断开。
     #[test]
-    fn tool_runs_break_on_assistant_text() {
+    fn process_runs_break_on_assistant_text() {
         let entries = vec![text("a"), tool("t1"), tool("t2"), text("b"), tool("t3")];
-        let runs = tool_runs(&entries);
+        let runs = process_runs(&entries);
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0], 1..3);
         assert_eq!(runs[1], 4..5);
     }
 
     #[test]
-    fn tool_runs_are_empty_without_tools() {
-        assert!(tool_runs(&[text("a")]).is_empty());
-        assert!(tool_runs(&[]).is_empty());
-    }
-
-    /// 模式只影响**组**：详细模式只在运行中把组展开，历史轮次仍手动。
-    #[test]
-    fn view_controls_group_body_by_default() {
-        assert!(!TranscriptView::Compact.group_body_open(true));
-        assert!(!TranscriptView::Standard.group_body_open(true));
-        assert!(TranscriptView::Detailed.group_body_open(true));
-        assert!(!TranscriptView::Detailed.group_body_open(false));
+    fn process_runs_include_reasoning_and_tools() {
+        let entries = vec![text("a"), reasoning("think"), tool("t1"), text("b")];
+        let runs = process_runs(&entries);
+        assert_eq!(runs, vec![1..3]);
     }
 
     #[test]
-    fn view_cycles_through_three_modes() {
-        assert_eq!(TranscriptView::Compact.next(), TranscriptView::Standard);
-        assert_eq!(TranscriptView::Standard.next(), TranscriptView::Detailed);
-        assert_eq!(TranscriptView::Detailed.next(), TranscriptView::Compact);
+    fn process_runs_are_empty_without_process_rows() {
+        assert!(process_runs(&[text("a")]).is_empty());
+        assert!(process_runs(&[]).is_empty());
+    }
+
+    #[test]
+    fn only_live_process_group_counts_as_running() {
+        let mut live = tool("t1");
+        let TimelineRow::Tool(ref mut view) = live else {
+            unreachable!()
+        };
+        view.status = dsh_protocol::transcript::ToolStatus::Running;
+        let settled = tool("t2");
+        assert!(process_group_running(&[live], true));
+        assert!(!process_group_running(&[settled], true));
+        assert!(!process_group_running(&[tool("t3")], false));
+    }
+
+    #[test]
+    fn reasoning_preview_follows_verbosity_and_stream_state() {
+        let low = ChatVerbosity::Low.policy();
+        let medium = ChatVerbosity::Medium.policy();
+        assert_eq!(reasoning_preview("第一行\n第二行", false, low), "");
+        assert_eq!(reasoning_preview("第一行\n第二行", false, medium), "第一行");
+        // 流式时未写完的单行不给预览；已换行的首行可以给。
+        assert_eq!(reasoning_preview("第一行", true, medium), "");
+        assert_eq!(reasoning_preview("第一行\n第二行", true, low), "第一行");
+    }
+
+    #[test]
+    fn verbosity_controls_group_body_by_default() {
+        assert!(!ChatVerbosity::Low.policy().group_body_open(true));
+        assert!(!ChatVerbosity::Medium.policy().group_body_open(true));
+        assert!(ChatVerbosity::High.policy().group_body_open(true));
+        assert!(!ChatVerbosity::High.policy().group_body_open(false));
+    }
+
+    fn session(id: &str, cwd: &str, updated_at: i64) -> SessionInfo {
+        SessionInfo {
+            id: id.to_owned(),
+            title: None,
+            cwd: cwd.to_owned(),
+            updated_at,
+            running: false,
+            blank: false,
+            mode: None,
+            model: None,
+        }
+    }
+
+    fn workspace(id: &str, path: &str, title: &str, session_ids: &[&str]) -> WorkspaceView {
+        WorkspaceView {
+            workspace_id: id.to_owned(),
+            path: path.to_owned(),
+            title: title.to_owned(),
+            session_ids: session_ids.iter().map(|id| (*id).to_owned()).collect(),
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    /// 归属走账本，不是 cwd：cwd 对不上也不串组。
+    #[test]
+    fn ledger_beats_cwd() {
+        let sessions = vec![session("s1", "/b", 2), session("s2", "/a", 1)];
+        let registry = WorkspaceRegistry {
+            items: vec![
+                workspace("w1", "/a", "A", &["s1"]),
+                workspace("w2", "/b", "B", &["s2"]),
+            ],
+            ..Default::default()
+        };
+        let plan = group_plan(&sessions, &registry, &SidebarPrefs::default(), "");
+        assert_eq!(plan[0].3, vec!["s1"]);
+        assert_eq!(plan[1].3, vec!["s2"]);
+        assert_eq!(plan.len(), 2);
+    }
+
+    /// 侧栏没有「未分组」：隐藏工作区的会话与无归属会话都不显示。
+    #[test]
+    fn hidden_and_unowned_sessions_are_not_shown() {
+        let sessions = vec![session("s1", "/a", 2), session("s2", "/other", 1)];
+        let registry = WorkspaceRegistry {
+            items: vec![workspace("w1", "/a", "A", &["s1"])],
+            ..Default::default()
+        };
+        let prefs = SidebarPrefs {
+            hidden_workspace_ids: HashSet::from(["w1".to_owned()]),
+            ..Default::default()
+        };
+        let plan = group_plan(&sessions, &registry, &prefs, "");
+        assert!(plan.is_empty());
+    }
+
+    /// 历史会话靠本地覆盖回到原工作区。
+    #[test]
+    fn adopted_sessions_join_their_workspace() {
+        let sessions = vec![session("s1", "/a", 1)];
+        let registry = WorkspaceRegistry {
+            items: vec![workspace("w1", "/a", "A", &[])],
+            ..Default::default()
+        };
+        let prefs = SidebarPrefs {
+            adopted: HashMap::from([("w1".to_owned(), vec!["s1".to_owned()])]),
+            ..Default::default()
+        };
+        let plan = group_plan(&sessions, &registry, &prefs, "");
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].2.as_str(), "w1");
+        assert_eq!(plan[0].3, vec!["s1"]);
+    }
+
+    /// 已注册但零会话的工作区仍显示行。
+    #[test]
+    fn empty_workspace_row_stays_without_ungrouped() {
+        let registry = WorkspaceRegistry {
+            items: vec![workspace("w1", "/a", "A", &[])],
+            ..Default::default()
+        };
+        let plan = group_plan(&[], &registry, &SidebarPrefs::default(), "");
+        assert_eq!(plan.len(), 1);
+        assert!(plan[0].3.is_empty());
+    }
+
+    /// 归档与非当前空白会话都不进树。
+    #[test]
+    fn archived_and_inactive_blank_are_excluded() {
+        let mut blank = session("s2", "/a", 3);
+        blank.blank = true;
+        let sessions = vec![session("s1", "/a", 2), blank, session("s3", "/other", 1)];
+        let registry = WorkspaceRegistry {
+            items: vec![workspace("w1", "/a", "A", &["s1"])],
+            archived_session_ids: vec!["s3".to_owned()],
+            ..Default::default()
+        };
+        let plan = group_plan(&sessions, &registry, &SidebarPrefs::default(), "");
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].3, vec!["s1"]);
     }
 }

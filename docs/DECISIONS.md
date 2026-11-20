@@ -2238,3 +2238,138 @@ pin、last_good、last_verified 组成保护集合。GC 只处理合法、未保
   `COWORK_SMOKE_SCRIPT` 指向等价脚本）以及可用的 `cargo`；它会跑真实模型调用，
   失败不会写 `last_verified`。
 - 正式 `/Applications/cowork.app` 仍保留上一版二进制，直到显式重建安装。
+
+## #56 时间线投影：UI 不再保存会话状态
+
+**日期**：2026-11-20
+
+**决策**：新增 `crates/dsh-protocol/src/timeline.rs`，把 follow 快照、流式块、
+工具日志和工具结果统一投影成 `ChatTimeline::rows()` 返回的 `TimelineRow`。
+GPUI 侧的 `Chat` 只保留这个投影器和展开/滚动等会话态；不再有自己的
+`entries` / `fold` / 本地序号，也不再从渲染容器反推消息身份。
+
+**权威来源**：
+
+- assistant `text` / `reasoning` / `tool-call` 内容块决定显示顺序和块身份；
+- `reasoning` 单独成行且只走纯文本弱化样式，不进入 markdown；
+- `tool/call` 是日志，只补 `started_at` / 耗时，不单独造行；
+- `tool/result` 只更新同 `callId` 的行；没有匹配调用时成为独立结果行；
+- markdown 只用于 assistant 正文；用户、工具输出和提示永远是纯文本。
+
+**稳定身份**：`RenderId::Assistant` / `Reasoning` 都带块下标。一次 assistant
+消息可能同时含推理、正文和多个工具块，旧的 `turn/step` 不足以区分它们。
+工具身份只用内容块里的 `callId`；未闭合流块没有权威 id，不抢先造行。
+
+**为什么**：
+
+- 旧路径把 fold 状态复制到 UI，再由 UI 自建 `entries` / `fold` / 本地序号；
+  两种状态机各自维护顺序和身份，任何一处漏同步就会重复或丢行。
+- 工具名/参数必须从 assistant 内容块拿；`tool/call` 只是日志。把它当行源会给
+  同一个调用造两个身份，也让流式块里的工具调用没有名字。
+- 渲染层不该懂事件文法。它现在只拿封闭的 `TimelineRow` / `ToolView`，
+  结构化工具卡、diff 预览和脱敏都在投影层完成。
+
+**边界**：工具输出不会走 markdown，详情用 allowlist + redaction + 32KiB 截断；
+展开/折叠仍是窗口会话态，不写 `$DSH_HOME`。本轮先把渲染 seam 统一，
+工具卡的详细视觉表现可以在这个 seam 上增量替换。
+
+**验证**：协议层新增契约测试覆盖有序内容块、流内/持久化 id 一致、
+工具调用与结果配对、孤立结果、未闭合工具块、敏感值脱敏；
+`cargo check --workspace` 和 `cargo test --workspace` 必须通过。
+
+## #57 全局 chat verbosity 与最小 settings 页面
+
+**日期**：2026-11-20
+
+**决策**：新增 `crates/dsh-client-ui/src/settings.rs`，把聊天详略收进一个全局
+`ChatVerbosity { Low, Medium, High }`。侧栏齿轮打开设置模式：**侧栏切成设置导航
+（工作区列表让位），按真值归属分组，只渲染非空组**；页面当前只有这一项，不再
+摆空占位，也没有面包屑与搜索（一层导航、一项设置，两者都是噪声）。三档取值用
+一行 segmented control，下方只显示当前档说明，并标出真值所在的 host profile。
+档位通过 `RenderPolicy` 派生为封闭规则：
+`reasoning_preview` / `group_header` / `group_body_open_while_running`。
+渲染层只读这组规则，不再自己判断档位。
+
+**为什么**：
+
+- 旧的 `TranscriptView` 是 `Chat` 的全局字段，却把切换器画在每个工具组右侧；
+  看像每组独立设置，点一下其实改全局，是最容易误读的伪局部控件。
+- verbosity 是对齐官方 `ui-chat.transcriptView` 的 host setting，不是客户端
+  自有偏好、会话状态或时间线事件。它应有一个稳定入口，真值仍由 dsh profile
+  独占，而不是寄生在工具组头。
+- `ChatTimeline` 继续只回答「有哪些行、顺序和身份是什么」；verbosity 只回答
+  「这些行按什么详略画」。两条关注点不合并。
+
+**官方语义对齐**：DeepSeek Harness 的 `ui-chat` 文档把 `Work details` 定义为
+`compact / standard / detailed / verbose` 四档。本项目界面仍只暴露三档：
+`low = compact`、`medium = standard`、`high = detailed`；第四档 `verbose`
+（历史过程也无条件展开）不进三档界面。三档都不把单个 reasoning / tool 正文
+自动展开：正文始终是显式点开的会话内状态。
+
+**行为**：
+
+- `Low`：过程组头只给类别摘要、过程组默认收起；reasoning 仍是一行，折叠时
+  不给 settled 预览，点开看纯文本；
+- `Medium`：过程组头给摘要 + 运行中工具详情、过程组默认收起；reasoning 折叠时
+  给首行预览；
+- `High`：运行中的过程组隐藏组头并直接显示正文；历史过程保留摘要组头且默认
+  收起；reasoning 折叠时给首行预览。
+
+完整的整轮折叠（`turn-process` 控制、折叠后保留哪些回复）仍超出当前时间线模型，
+所以本版只做到过程组层，不把它宣称成官方全量 folding。
+
+会话内点开的组 / 工具正文 / reasoning 正文仍可覆盖默认值；切档时清掉这些覆盖，
+让新档位立即一致。
+
+**配置归属**：真值是 `~/.dsh/profiles/cowork/` 里的 host profile 设置，客户端不
+直接拼路径或改 YAML。每次 host ready 后调用 `settings/describe`，从 `ui-chat`
+namespace 读用户层优先的 `transcriptView`；settings 页点击时调用 `settings/update`，
+用读到的 `revision` 作为 `expectedRevision`，让并发编辑被 host 拒绝而不是覆盖。
+写成功后 host 回送实际值；读写失败则回送点击前的值和错误说明。客户端只在内存
+镜像里保存当前档位，不写 `~/.cowork/config.toml`、不读写旧 `settings.json`、
+不再保留 `COWORK_VERBOSITY` / `COWORK_TRANSCRIPT_VIEW` 覆盖。
+
+UI 点击立即更新内存镜像并清掉会话内展开覆盖，因此渲染即时变化；host 的权威
+回送随后确认或回滚。外部直接改 profile 配置没有文件 watcher，下一次 host 启动
+或 settings 页写入时才会重新投影。
+
+**验证**：`settings.rs` 覆盖官方值/旧别名映射、稳定键、默认档和三档策略；
+`apps/desktop/src/host_settings.rs` 覆盖用户层优先、缺失/未知值回默认；chat 测试
+覆盖过程分组、运行中判定、reasoning 预览与组默认开合；workspace 测试全部通过。
+
+## #58 工作区移除改为客户端隐藏，分组走账本
+
+**日期**：2026-11-20
+
+**决策**：侧栏的「移除工作区」不再调用 host 的 `workspace/delete`，改为客户端
+软隐藏（`SidebarPrefs.hidden_workspace_ids`）。侧栏分组的真源改为 host 账本
+`WorkspaceView.session_ids`，加上一份本地历史覆盖（老客户端用 cwd-only 建会话，
+host 从未记过它们）。`session/create` 一律传 `workspaceId`，让 host 把新会话写进
+账本。本地快照补齐 `sessionIds`、隐藏集合与历史覆盖。
+
+**为什么**：官方 desktop/web 的 `workspace/delete` 语义是「删注册、目录/文件/日志
+都不动、会话落到 Ungrouped；重新添加同一目录开一个空的新项目」。用户要的是
+可逆的「移除」而不是这个。旧实现把两件事做错了：分组按 `same_path(session.cwd,
+workspace.path)` 现算，无视 host 已有的账本；移除又直接接了 host 硬删除，账本被
+清掉。两个缺陷叠加，才出现「移除了工作区，会话还赖在『未分组』里」。
+
+**行为**：
+
+- 「移除」只把 `workspace_id` 记入本地隐藏集合；host 注册、账本、目录、会话一概
+  不动，也不归档、不停跑。
+- **侧栏没有「未分组」组**：Workspace 只列工作区；隐藏的工作区整组跳过，它的
+  会话一并消失；账本里没有归属的历史会话也不在侧栏出现（它们仍在 host 上，可
+  通过搜索访问）。
+- 侧栏底部新增折叠的「已隐藏的工作区（N）」，逐条可点恢复，避免会话静默消失。
+- 重新添加同一目录时 `workspace/create` 按 canonical path 幂等返回原 UUID
+  （`created=false`），取消隐藏后老会话随账本原样回到该组；只有真正新建
+  （`created=true`）才按 cwd 把历史会话收养进本地覆盖。
+- 归档/置顶与隐藏正交；归档会话仍不进树，在底部「已归档」区。
+
+**与官方偏差**：官方把 Ungrouped 当安全边界（删注册后会话永远可见），本项目改为
+可恢复的隐藏态。这是**客户端私有覆盖**，host 账本与其他 surface 不共享隐藏状态；
+文档里不把它说成官方语义。
+
+**验证**：`group_plan` 单测覆盖账本优先于 cwd、隐藏与无归属会话都不显示、历史覆盖
+归位、空工作区行保留、归档与非当前空白会话过滤；`cache.rs` round-trip 覆盖新增
+字段与旧快照兼容；workspace 协议测试全部通过。

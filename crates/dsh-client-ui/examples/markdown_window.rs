@@ -5,8 +5,9 @@
 //! cargo run -p dsh-client-ui --profile probe --example markdown_window
 //! ```
 
-use dsh_client_ui::markdown;
+use dsh_client_ui::markdown::{self, TextRole};
 use dsh_protocol::MessageId;
+use dsh_protocol::RenderId;
 use gpui_kit::*;
 
 const SAMPLE: &str = r#"## 三个目录名
@@ -49,7 +50,14 @@ impl Render for Probe {
             .size_full()
             .bg(rgb(0x0f0f10))
             .p(px(28.))
-            .child(markdown::text(MessageId::Turn { turn: 0, step: 0 }, SAMPLE))
+            .child(markdown::text(
+                RenderId::Assistant {
+                    id: MessageId::Turn { turn: 0, step: 0 },
+                    index: 0,
+                },
+                SAMPLE,
+                TextRole::Assistant,
+            ))
     }
 }
 

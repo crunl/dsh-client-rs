@@ -26,10 +26,25 @@ pub enum ToolStatus {
 pub struct ToolCall {
     /// `callId`；实时更新时用它做 upsert 的键。
     pub id: String,
-    /// wire 上的工具名，原样显示（`bash` / `read` / `web_fetch`）。
+    /// wire 上的工具名；来自 assistant 消息的 `tool-call` 块，日志事件只兜底。
     pub name: String,
     /// 单行摘要：参数里最能说明「它在干什么」的那个字符串。
     pub summary: String,
+    /// 已解析的工具参数；原始 JSON 字符串在这里解析成对象。
+    pub arguments: Value,
+    /// 名字/参数是否来自权威内容块（assistant message 或 block-end）。
+    /// `tool/call` 日志事件只补时间，不能覆盖内容块。
+    pub authoritative: bool,
+    /// 工具回执的 `meta`（工作目录、耗时细分等）。
+    pub meta: Value,
+    /// `tool/call.time`；日志专用事件只提供时间。
+    pub started_at: Option<i64>,
+    /// `tool/result.time`。
+    pub finished_at: Option<i64>,
+    /// 所属 `(turn, step)`，用于稳定身份与排查。
+    pub turn: u64,
+    /// 所属 `(turn, step)`，用于稳定身份与排查。
+    pub step: u64,
     /// 状态。
     pub status: ToolStatus,
     /// 结果正文（已截断，见 [`DETAIL_LIMIT`]）；没有结果时为空。
@@ -96,9 +111,20 @@ pub enum Entry {
     },
     /// 助手回答（已提交）。
     Assistant {
+        /// 身份。`(turn, step)` 相同但内容块不同时靠 `index` 区分。
+        id: MessageId,
+        /// 内容块下标；渲染身份的一部分。
+        index: u64,
+        /// 正文（markdown 源文）。
+        text: String,
+    },
+    /// assistant 的 reasoning 内容块；默认弱化展示。
+    Reasoning {
         /// 身份。
         id: MessageId,
-        /// 正文（markdown 源文）。
+        /// 内容块下标。
+        index: u64,
+        /// 源文。
         text: String,
     },
     /// 一次工具调用。
@@ -107,12 +133,24 @@ pub enum Entry {
     Notice(String),
 }
 
+impl Entry {
+    /// 这条行是否是可绘制的正文（用于分页/日志过滤）。
+    pub fn is_text(&self) -> bool {
+        matches!(
+            self,
+            Self::User { .. } | Self::Assistant { .. } | Self::Reasoning { .. }
+        )
+    }
+}
+
 /// 事件 → 行 的折叠器。
 #[derive(Debug, Default)]
 pub struct Transcript {
     entries: Vec<Entry>,
     /// `callId` → `entries` 下标，用于把结果写回调用行。
     tool_index: HashMap<String, usize>,
+    /// `callId` → `tool/call.time`；日志专用事件只保留这一点信息。
+    call_times: HashMap<String, i64>,
 }
 
 impl Transcript {
@@ -134,10 +172,15 @@ impl Transcript {
 
     /// 吃一条会话事件。不认识的类型直接忽略（协议是开放轴，见 DECISIONS #8）。
     ///
-    /// 返回受影响的行下标：实时流据此增量更新界面，不必整份重发。
-    pub fn push_event(&mut self, event: &Value) -> Option<usize> {
-        let kind = event.get("type")?.as_str()?;
-        let data = event.get("data")?;
+    /// 返回受影响的行下标：实时流据此增量更新界面，不必整份重发。一条
+    /// `assistant/message` 可能包含多个 `tool-call` 块，所以返回的是列表。
+    pub fn push_event(&mut self, event: &Value) -> Vec<usize> {
+        let Some(kind) = event.get("type").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let Some(data) = event.get("data") else {
+            return Vec::new();
+        };
         match kind {
             "user/message" => {
                 // 只有真人说的才进时间线；工具回执、系统注入都不算。
@@ -146,56 +189,45 @@ impl Transcript {
                     .and_then(Value::as_str)
                     .is_some_and(|kind| kind == "user");
                 if !from_user {
-                    return None;
+                    return Vec::new();
                 }
                 let text = text_of(data.get("content"));
-                (!text.trim().is_empty()).then(|| {
-                    self.entries.push(Entry::User {
-                        id: MessageId::of(data, event),
-                        text,
-                    });
-                    self.entries.len() - 1
-                })
-            }
-            "assistant/message" => {
-                let text = text_of(data.pointer("/message/content"));
-                (!text.trim().is_empty()).then(|| {
-                    self.entries.push(Entry::Assistant {
-                        id: MessageId::of(data, event),
-                        text,
-                    });
-                    self.entries.len() - 1
-                })
-            }
-            "tool/call" => {
-                let id = data.get("callId")?.as_str()?.to_owned();
-                let name = data
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("tool")
-                    .to_owned();
-                let summary = summarize(name.as_str(), data.get("arguments"));
-                let index = self.entries.len();
-                // 同一个 callId 重放两次（快照 + 增量）时不要重复插入。
-                if let Some(existing) = self.tool_index.get(&id) {
-                    return Some(*existing);
+                if text.trim().is_empty() {
+                    return Vec::new();
                 }
-                self.entries.push(Entry::Tool(ToolCall {
-                    id: id.clone(),
-                    name,
-                    summary,
-                    status: ToolStatus::Running,
-                    detail: String::new(),
-                    detail_chars: 0,
-                }));
-                self.tool_index.insert(id, index);
-                Some(index)
+                self.entries.push(Entry::User {
+                    id: MessageId::of(data, event),
+                    text,
+                });
+                vec![self.entries.len() - 1]
+            }
+            "assistant/message" => self.push_assistant_message(data, event),
+            "tool/call" => {
+                let Some(id) = data.get("callId").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                let id = id.to_owned();
+                let time = event_time(event, data);
+                if let Some(time) = time {
+                    self.call_times.insert(id.clone(), time);
+                }
+                // `tool/call` 是日志专用事件：只补开始时间，不凭它建内容行。
+                // 行由 assistant 消息的 `tool-call` 块建立；只有结果时降级为独立行。
+                if let Some(&index) = self.tool_index.get(&id)
+                    && let Some(Entry::Tool(call)) = self.entries.get_mut(index)
+                    && let Some(time) = time
+                {
+                    call.started_at = Some(time);
+                    return vec![index];
+                }
+                Vec::new()
             }
             "tool/result" => {
                 // 结果的 `callId` **不在** `data` 顶层：它在工具回执消息里
                 // （实测 v4 会话是 `message.toolCallId`，老数据还有 `message.source.callId`）。
-                let id = call_id_of(data)?;
-                let index = *self.tool_index.get(&id)?;
+                let Some(id) = call_id_of(data) else {
+                    return Vec::new();
+                };
                 let failed = data
                     .pointer("/message/isError")
                     .and_then(Value::as_bool)
@@ -204,19 +236,122 @@ impl Transcript {
                 let raw = text_of(data.pointer("/message/content"));
                 let detail_chars = raw.chars().count();
                 let detail = truncate(raw);
-                if let Some(Entry::Tool(call)) = self.entries.get_mut(index) {
-                    call.status = if failed {
-                        ToolStatus::Error
-                    } else {
-                        ToolStatus::Ok
-                    };
-                    call.detail = detail;
-                    call.detail_chars = detail_chars;
+                let status = if failed {
+                    ToolStatus::Error
+                } else {
+                    ToolStatus::Ok
+                };
+                let meta = data.get("meta").cloned().unwrap_or(Value::Null);
+                let finished_at = event_time(event, data);
+                if let Some(&index) = self.tool_index.get(&id) {
+                    if let Some(Entry::Tool(call)) = self.entries.get_mut(index) {
+                        call.status = status;
+                        call.detail = detail;
+                        call.detail_chars = detail_chars;
+                        call.meta = meta;
+                        call.finished_at = finished_at;
+                    }
+                    return vec![index];
                 }
-                Some(index)
+                // 没配到调用也绝不丢结果：降级成只有结果的独立工具行。
+                let call = ToolCall {
+                    id: id.clone(),
+                    name: "tool".to_owned(),
+                    summary: first_line(&detail),
+                    arguments: Value::Null,
+                    authoritative: false,
+                    meta,
+                    started_at: self.call_times.get(&id).copied(),
+                    finished_at,
+                    turn: data.get("turn").and_then(Value::as_u64).unwrap_or(0),
+                    step: data.get("step").and_then(Value::as_u64).unwrap_or(0),
+                    status,
+                    detail,
+                    detail_chars,
+                };
+                vec![self.push_tool(call)]
             }
-            _ => None,
+            _ => Vec::new(),
         }
+    }
+
+    /// 从 assistant 消息的内容块按原顺序投影正文 / reasoning / 工具调用。
+    fn push_assistant_message(&mut self, data: &Value, event: &Value) -> Vec<usize> {
+        let content = data.pointer("/message/content");
+        let id = MessageId::of(data, event);
+        let (turn, step) = match id {
+            MessageId::Turn { turn, step } => (turn, step),
+            MessageId::Seq(_) => (0, 0),
+        };
+        let mut touched = Vec::new();
+        for (index, block) in content_blocks(content) {
+            let kind = block.get("type").and_then(Value::as_str).unwrap_or("text");
+            let text = block
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            match kind {
+                "reasoning" if !text.trim().is_empty() => {
+                    self.entries.push(Entry::Reasoning { id, index, text });
+                    touched.push(self.entries.len() - 1);
+                }
+                "text" if !text.trim().is_empty() => {
+                    self.entries.push(Entry::Assistant { id, index, text });
+                    touched.push(self.entries.len() - 1);
+                }
+                "tool-call" => {
+                    let Some(call_id) = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .or_else(|| block.get("callId").and_then(Value::as_str))
+                    else {
+                        continue;
+                    };
+                    let name = block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool")
+                        .to_owned();
+                    let arguments = crate::timeline::parse_arguments(
+                        block.get("arguments").cloned().unwrap_or(Value::Null),
+                    );
+                    let summary = summarize(&name, Some(&arguments));
+                    let call = ToolCall {
+                        id: call_id.to_owned(),
+                        name,
+                        summary,
+                        arguments,
+                        authoritative: true,
+                        meta: Value::Null,
+                        started_at: self.call_times.get(call_id).copied(),
+                        finished_at: None,
+                        turn,
+                        step,
+                        status: ToolStatus::Running,
+                        detail: String::new(),
+                        detail_chars: 0,
+                    };
+                    touched.push(self.push_tool(call));
+                }
+                _ => {}
+            }
+        }
+        touched
+    }
+
+    /// 插入或合并一条工具行，返回其下标。
+    fn push_tool(&mut self, call: ToolCall) -> usize {
+        if let Some(&index) = self.tool_index.get(&call.id)
+            && let Some(Entry::Tool(existing)) = self.entries.get_mut(index)
+        {
+            merge_tool(existing, call);
+            return index;
+        }
+        let index = self.entries.len();
+        self.tool_index.insert(call.id.clone(), index);
+        self.entries.push(Entry::Tool(call));
+        index
     }
 
     /// 按 `callId` 找一行（实时更新后用来回填）。
@@ -244,6 +379,100 @@ impl Transcript {
     }
 }
 
+/// 事件时间；顶层 `time` 优先，老数据也可能放在 `data.time`。
+fn event_time(event: &Value, data: &Value) -> Option<i64> {
+    event
+        .get("time")
+        .or_else(|| data.get("time"))
+        .and_then(Value::as_i64)
+}
+
+/// 内容块的统一视图；字符串/单块/数组三种历史形状都接受。
+fn content_blocks(content: Option<&Value>) -> Vec<(u64, Value)> {
+    let Some(content) = content else {
+        return Vec::new();
+    };
+    match content {
+        Value::Array(blocks) => blocks
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, block)| (index as u64, block))
+            .collect(),
+        Value::String(text) => vec![(0, serde_json::json!({ "type": "text", "text": text }))],
+        block => vec![(0, block.clone())],
+    }
+}
+
+/// 合并同名工具调用：内容块负责名字/参数，日志事件负责时间，结果负责状态/正文。
+pub(crate) fn merge_tool(existing: &mut ToolCall, incoming: ToolCall) {
+    let keep_identity =
+        incoming.authoritative || (!existing.authoritative && existing.name == "tool");
+    let status = if incoming.status != ToolStatus::Running {
+        incoming.status
+    } else {
+        existing.status
+    };
+    let detail = if incoming.detail.is_empty() {
+        existing.detail.clone()
+    } else {
+        incoming.detail
+    };
+    let detail_chars = if detail == existing.detail {
+        existing.detail_chars
+    } else {
+        incoming.detail_chars
+    };
+    let meta = if incoming.meta.is_null() {
+        existing.meta.clone()
+    } else {
+        incoming.meta
+    };
+    let finished_at = incoming.finished_at.or(existing.finished_at);
+    let started_at = incoming.started_at.or(existing.started_at);
+    let name = if keep_identity {
+        incoming.name
+    } else {
+        existing.name.clone()
+    };
+    let summary = if keep_identity {
+        incoming.summary
+    } else {
+        existing.summary.clone()
+    };
+    let arguments = if incoming.arguments.is_null() {
+        existing.arguments.clone()
+    } else {
+        incoming.arguments
+    };
+    let authoritative = existing.authoritative || incoming.authoritative;
+    let turn = if incoming.turn == 0 {
+        existing.turn
+    } else {
+        incoming.turn
+    };
+    let step = if incoming.step == 0 {
+        existing.step
+    } else {
+        incoming.step
+    };
+    *existing = ToolCall {
+        id: existing.id.clone(),
+        name,
+        summary,
+        arguments,
+        authoritative,
+        meta,
+        started_at,
+        finished_at,
+        turn,
+        step,
+        status,
+        detail,
+        detail_chars,
+    };
+}
+
 /// 结果的 `callId` 可能在三个地方（实测 v4 会话：`message.toolCallId`）。
 fn call_id_of(data: &Value) -> Option<String> {
     for pointer in ["/callId", "/message/toolCallId", "/message/source/callId"] {
@@ -267,12 +496,17 @@ fn truncate(text: String) -> String {
 ///
 /// 工具成千上万，不可能逐个写摘要；所以按优先级挑参数名，挑不到就退化成
 /// `k=v` 列表。宁可朴素也不要猜错。
-fn summarize(name: &str, arguments: Option<&Value>) -> String {
-    let Some(raw) = arguments.and_then(Value::as_str) else {
+pub(crate) fn summarize(name: &str, arguments: Option<&Value>) -> String {
+    let Some(raw) = arguments else {
         return String::new();
     };
-    let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
-        return first_line(raw);
+    let parsed = match raw {
+        Value::String(text) => match serde_json::from_str::<Value>(text) {
+            Ok(value) => value,
+            Err(_) => return first_line(text),
+        },
+        Value::Object(_) => raw.clone(),
+        _ => return String::new(),
     };
     // 命令行工具：命令本身比模型写的 description 更能说明发生了什么。
     let shell = matches!(name, "bash" | "pwsh" | "bash_persistent" | "terminal_send");
@@ -369,6 +603,7 @@ mod tests {
     fn call(call_id: &str, name: &str, arguments: &str) -> Value {
         json!({
             "type": "tool/call",
+            "time": 1794675833000i64,
             "data": { "turn": 1, "step": 1, "callId": call_id, "name": name, "arguments": arguments }
         })
     }
@@ -396,6 +631,33 @@ mod tests {
         json!({
             "type": "user/message",
             "data": { "role": "user", "source": { "kind": "user" }, "content": [{ "type": "text", "text": text }] }
+        })
+    }
+
+    fn assistant_with_tool(
+        turn: u64,
+        step: u64,
+        call_id: &str,
+        name: &str,
+        arguments: &str,
+    ) -> Value {
+        json!({
+            "type": "assistant/message",
+            "seq": 200 + turn * 10 + step,
+            "time": 1794675833100i64,
+            "data": {
+                "turn": turn,
+                "step": step,
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool-call",
+                        "id": call_id,
+                        "name": name,
+                        "arguments": arguments,
+                    }]
+                }
+            }
         })
     }
 
@@ -450,14 +712,24 @@ mod tests {
     }
 
     #[test]
-    fn call_and_result_pair_into_one_row() {
+    fn assistant_tool_block_and_result_pair_into_one_row() {
         let mut transcript = Transcript::new();
         transcript.push_event(&user("跑一下测试"));
-        transcript.push_event(&call("c1", "bash", r#"{"command":"cargo test"}"#));
+        transcript.push_event(&assistant_with_tool(
+            1,
+            1,
+            "c1",
+            "bash",
+            r#"{"command":"cargo test"}"#,
+        ));
         assert!(
             matches!(transcript.entries().last(), Some(Entry::Tool(call)) if call.status == ToolStatus::Running)
         );
-
+        transcript.push_event(&call("c1", "bash", r#"{"command":"cargo test"}"#));
+        let Some(Entry::Tool(call)) = transcript.entries().last() else {
+            panic!("最后一行应是工具行");
+        };
+        assert_eq!(call.started_at, Some(1794675833000));
         transcript.push_event(&result("c1", "ok\n", false));
         let Entry::Tool(call) = transcript.entries().last().expect("有行") else {
             panic!("最后一行应是工具行");
@@ -465,7 +737,7 @@ mod tests {
         assert_eq!(call.status, ToolStatus::Ok);
         assert_eq!(call.summary, "cargo test");
         assert_eq!(call.detail, "ok\n");
-        // 两条事件只长出一行。
+        // user + 一条工具行；日志时间并入工具行，不新增行。
         assert_eq!(transcript.entries().len(), 2);
     }
 
@@ -478,7 +750,7 @@ mod tests {
             panic!("应有工具行");
         };
         assert_eq!(call.status, ToolStatus::Error);
-        assert_eq!(call.summary, "/tmp/x.txt");
+        assert_eq!(call.detail, "");
     }
 
     #[test]
@@ -506,20 +778,28 @@ mod tests {
         let mut transcript = Transcript::new();
         transcript.push_event(&call("c3", "bash", r#"{"command":"ls"}"#));
         transcript.push_event(&call("c3", "bash", r#"{"command":"ls"}"#));
-        assert_eq!(transcript.entries().len(), 1);
+        assert!(transcript.entries().is_empty());
     }
 
     #[test]
-    fn result_without_call_is_ignored() {
+    fn result_without_call_becomes_standalone_row() {
         let mut transcript = Transcript::new();
-        assert!(transcript.push_event(&result("nope", "x", false)).is_none());
-        assert!(transcript.entries().is_empty());
+        transcript.push_event(&result("nope", "x", false));
+        // 调用缺失时结果不丢：降级成只有结果的独立行。
+        let Some(Entry::Tool(call)) = transcript.entries().first() else {
+            panic!("应有独立工具行");
+        };
+        assert_eq!(call.id, "nope");
+        assert_eq!(call.detail, "x");
+        assert!(!call.authoritative);
     }
 
     #[test]
     fn summary_falls_back_to_key_value_pairs() {
         let mut transcript = Transcript::new();
-        transcript.push_event(&call(
+        transcript.push_event(&assistant_with_tool(
+            2,
+            1,
             "c4",
             "office_render",
             r#"{"engine":"wasm","pages":3}"#,

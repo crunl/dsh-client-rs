@@ -240,9 +240,9 @@ mode 写路径：slash 命令 `/permission <preset>` 经 `session/prompt` 提交
 系统目录框给出），行内 hover 的加号才是在某个已有目录下开会话。把头部加号
 做成「在当前工作区开会话」，用户就没有任何入口把一个新目录加进侧栏。
 
-**垃圾桶走行内二次确认**（`workspace/delete`）：点一下把行尾换成「取消 / 移除」，
-点「移除」才真删。删的只是**注册**：目录不删、会话不删，那几条会话落到最下面的
-「未分组」里；误点后重新加一遍目录就能回来（DECISIONS #35）。
+**垃圾桶走行内二次确认**：点一下把行尾换成「取消 / 移除」，点「移除」才生效。
+现在「移除」是客户端本地隐藏，不调用 `workspace/delete`：整组连同会话从侧栏消失，
+底部出现可点开的「已隐藏的工作区」；重新添加同一目录后老会话归位（DECISIONS #58）。
 
 **会话只能归档，没有删除**（DECISIONS #36）：host 的 `workspace/*` 里没有删会话的
 接口，只有 `archiveSession` / `unarchiveSession`。归档把会话从树里拿走、记录与目录
@@ -265,8 +265,10 @@ mode 写路径：slash 命令 `/permission <preset>` 经 `session/prompt` 提交
 （红绿灯只占标题栏那一条高度，内容没必要跟着缩进）。
 
 数据来自两路：**分组**看 `workspace/follow`（注册表顺序，没有会话的空工作区也显示），
-**会话**看 `session/list`；会话按 `cwd` 对回工作区的 `path`（`/private/tmp` 与
-`/tmp` 视为同一路径），对不上的归到底部的「未分组」。会话组内按 `updatedAt` 倒序；
+**会话**看 `session/list`。归属真源是账本 `session_ids`（cwd 只在收养老会话时做一次性
+启发）；侧栏只显示工作区，**没有「未分组」组**——无归属的历史会话不在侧栏出现，
+它们仍在 host 上、可通过搜索访问。「移除」是客户端本地隐藏，隐藏组的会话一起
+不显示，底部有可恢复的「已隐藏的工作区」（#58）。会话组内按 `updatedAt` 倒序；
 标题取投影 `title`；**空白会话只显示当前那一条**（官方 `pinCurrentBlank` 语义），
 否则每次启动都会多出一片「新会话」。
 
@@ -514,14 +516,14 @@ tool/call   {turn, step, callId, name, arguments}      ┐
 
 | 模式 | 组头 | 组体默认 | 单个工具正文 |
 | --- | --- | --- | --- |
-| `compact` 简洁 | 只给类别 | 收起 | 手动展开 |
-| `standard` 标准（缺省） | 类别 + 数量 | 收起 | 手动展开 |
-| `detailed` 详细 | 类别 + 数量 + 实时提示 | 运行中展开，历史收起 | 手动展开 |
+| `compact` / 简洁 | 只给类别摘要 | 收起 | 手动展开 |
+| `standard` / 标准（缺省） | 类别摘要 + 运行中工具详情 | 收起 | 手动展开 |
+| `detailed` / 详细 | 运行中隐藏组头，历史保留摘要 | 运行中展开，历史收起 | 手动展开 |
 
 **任何档位都不自动灌输出**——这是官方 `transcriptView` 的同一口径：档位只决定
-过程组的组织方式，工具正文永远点开才看。初始档位读 `COWORK_TRANSCRIPT_VIEW`
-（缺省 `standard`），没有设置面板之前切换按钮就放在组头右侧（点一下换下一档）；
-档位本身暂不写盘（下次启动回到缺省/环境变量）。
+过程组的组织方式，工具正文永远点开才看。唯一的切换入口是 settings 页；档位
+真值在 dsh host profile 的 `ui-chat.transcriptView`，启动读 `settings/describe`，
+点击经 `settings/update` 写回，客户端只保留内存镜像。
 
 ### 助手正文的 markdown
 
@@ -987,6 +989,26 @@ if (profile.toLowerCase() === 'desktop') {
 | 用户机器无任何凭据 | 空模型列表：能打开、能看历史、能发（由 host 报错）。状态行写「请选择模型」，下拉里是「暂无可用模型」+ 提供方失败行（#42） |
 | 端口已打印但连接失败 | 重试握手有限次后退回错误态，不无限循环 |
 
+### 聊天详略的入口
+
+全局聊天详略只在 settings 页面修改，由 `ChatVerbosity` 派生 `RenderPolicy` 后
+交给渲染层。真值在 dsh host profile 的 `ui-chat.transcriptView`：启动经
+`settings/describe` 读入，点击经 `settings/update` 写回；客户端只有内存镜像。
+过程组头不再放档位切换器：它看起来像每组独立设置，实际却改全局。
+时间线投影不因档位变化；档位只决定过程组开合、组头摘要、reasoning 是否显示
+settled 首行预览。单个工具 / reasoning 正文永远手动展开，逐块的开关是会话内状态。
+
+档位对应官方 `Work details` 的前三档：`low = compact`、`medium = standard`、
+`high = detailed`。官方第四档 `verbose` 没有 UI 选项；若 host 里读到该值，native
+客户端按最接近的 `high` 渲染，不宣称实现历史全展开。整轮 folding 暂不实现。
+
+### 聊天时间线的边界
+
+会话历史先投影成 `ChatTimeline::rows()` 的 `TimelineRow`，GPUI 才能绘制。
+`Chat` 只保存投影器与展开/滚动等会话态；follow 快照、流式块、工具日志和
+工具结果的身份/顺序/脱敏都归 `dsh-protocol::timeline`。渲染层不解析事件 JSON，
+不把工具输出当 markdown，也不自行生成本地消息身份。
+
 ### 调试开关
 
 提供 headless 模式（不建窗口）dump 协议数据：启动 host → 握手 → 拉一次
@@ -1001,7 +1023,6 @@ if (profile.toLowerCase() === 'desktop') {
 | `DSH_DEBUG_WAKE_AFTER=<秒>` | 到点发一条 `RefreshSessions`，验证「休眠后能被命令叫醒」 |
 | `DSH_DEBUG_OPEN=<id>` | 启动就打开该会话（也作为休眠醒来后的恢复目标） |
 | `DSH_DEBUG_TOOL_OPEN=1` | 把所有工具行正文当成展开（验排版用；正常用法是点开） |
-| `COWORK_TRANSCRIPT_VIEW=compact\|standard\|detailed` | 过程组初始档位（缺省 `standard`） |
 | `COWORK_RICH_TEXT=0` | 助手正文退回纯文本（同一入口的降级分支，量内存用） |
 
 ## 非目标的边界重申
