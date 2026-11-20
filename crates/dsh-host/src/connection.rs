@@ -5,13 +5,28 @@
 
 use dsh_protocol::wire::{ClientRequest, RpcResultError, ServerResponse};
 use reqwest::header::{self, HeaderMap, SET_COOKIE};
-use reqwest::{Client, StatusCode, Url, redirect::Policy};
+use reqwest::{Client, Response, StatusCode, Url, redirect::Policy};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::sync::OnceCell;
+use std::time::Duration;
 
 use crate::mux::Mux;
+
+/// TCP 建连上限。host 在本机，超过这个时间基本就是卡死了。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 单次 HTTP 请求（含读完响应体）的上限。
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// WebSocket 升级握手的上限。
+pub(crate) const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 成功响应体的字节上限。超过就报错，不把整个响应攒进内存。
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// 错误响应体只读这么多，用于报错文案。
+const MAX_ERROR_BODY_BYTES: usize = 512;
 
 /// `interactions` 声明：决定这个 peer 是否参与转发的人类交互。
 ///
@@ -69,6 +84,15 @@ pub enum HostError {
         /// 响应体（截断到 512 字节）。
         body: String,
     },
+    /// 响应体超过 [`MAX_BODY_BYTES`]。
+    #[error("响应体超过 {limit} 字节上限")]
+    BodyTooLarge {
+        /// 允许的上限（字节）。
+        limit: usize,
+    },
+    /// 连接或握手超时（host 没有响应）。
+    #[error("超时：host 没有响应")]
+    Timeout,
     /// 响应体不是合法的信封。
     #[error("响应无法解析: {source}；原文: {body}")]
     Decode {
@@ -115,8 +139,11 @@ pub struct Connection {
     interactions: Interactions,
     /// 当前 cookie。host 重启后需要整体替换，所以放在锁里。
     cookie: std::sync::RwLock<String>,
-    /// 这条连接唯一的流 socket（延迟建立，见 [`crate::mux`]）。
-    mux: OnceCell<Arc<Mux>>,
+    /// 这条连接当前的流 socket（延迟建立，见 [`crate::mux`]）。
+    ///
+    /// 用异步锁：建 socket 期间持有它，并发调用者排队等同一个结果；
+    /// 存的 mux 若已死（socket 断开），下一次 `Mux::of` 会替换它。
+    mux: tokio::sync::Mutex<Option<Arc<Mux>>>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -153,7 +180,12 @@ impl Connection {
 
         // 不跟随重定向：`/connect` 的 Location 指向 `./api/remote.mux`，
         // 那是给浏览器 Web UI 的落点，对我们没有意义（段内带点，会 404）。
-        let http = Client::builder().redirect(Policy::none()).build()?;
+        // 超时：host 接了连接但不回话时，调用方必须能拿到错误而不是永远挂住。
+        let http = Client::builder()
+            .redirect(Policy::none())
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .build()?;
 
         let connection = Self {
             http,
@@ -161,7 +193,7 @@ impl Connection {
             token,
             interactions,
             cookie: std::sync::RwLock::new(String::new()),
-            mux: OnceCell::new(),
+            mux: tokio::sync::Mutex::new(None),
         };
 
         let cookie = connection.handshake().await?;
@@ -258,17 +290,26 @@ impl Connection {
             .map_err(reqwest::Error::without_url)?;
 
         let status = response.status();
-        let body = response.text().await.map_err(reqwest::Error::without_url)?;
-
         if status == StatusCode::UNAUTHORIZED {
             return Err(HostError::Unauthorized);
         }
         if !status.is_success() {
+            // 错误响应只用于报错文案，读到 512 字节就停。
+            let (bytes, _truncated) = read_body(response, MAX_ERROR_BODY_BYTES).await?;
             return Err(HostError::Status {
                 status: status.as_u16(),
-                body: truncate(body),
+                body: truncate(String::from_utf8_lossy(&bytes).into_owned()),
             });
         }
+
+        // 成功响应：边读边计数，超过上限立即失败，不把超大响应整块攒进内存。
+        let (bytes, overflow) = read_body(response, MAX_BODY_BYTES).await?;
+        if overflow {
+            return Err(HostError::BodyTooLarge {
+                limit: MAX_BODY_BYTES,
+            });
+        }
+        let body = String::from_utf8_lossy(&bytes).into_owned();
 
         let parsed: ServerResponse<T> =
             serde_json::from_str(&body).map_err(|source| HostError::Decode {
@@ -313,10 +354,30 @@ impl Connection {
         format!("{scheme}://{host}:{port}/api/remote.mux")
     }
 
-    /// 这条连接的流多路复用器（首次用到时才建 socket）。
-    pub(crate) fn mux(&self) -> &OnceCell<Arc<Mux>> {
+    /// 这条连接的流多路复用器槽位（见 [`crate::mux`]）。
+    pub(crate) fn mux(&self) -> &tokio::sync::Mutex<Option<Arc<Mux>>> {
         &self.mux
     }
+}
+
+/// 最多读 `limit` 字节，返回（已读字节，是否还有剩余被截掉）。
+///
+/// 逐块读取，超出上限的部分不会进入内存。
+async fn read_body(mut response: Response, limit: usize) -> Result<(Vec<u8>, bool), HostError> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(reqwest::Error::without_url)?
+    {
+        let room = limit - buf.len();
+        if chunk.len() > room {
+            buf.extend_from_slice(&chunk[..room]);
+            return Ok((buf, true));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok((buf, false))
 }
 
 fn first_cookie(headers: &HeaderMap) -> Result<String, HostError> {
