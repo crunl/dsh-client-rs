@@ -527,13 +527,15 @@ impl RuntimeStore {
 
     fn load_state(&self) -> Result<RuntimeState, String> {
         if !self.state_path.is_file() {
-            let mut state = RuntimeState::default();
-            state.bootstrap_protected = self
-                .scan_installed()
-                .into_iter()
-                .filter(|item| item.view.valid)
-                .map(|item| item.id)
-                .collect();
+            let state = RuntimeState {
+                bootstrap_protected: self
+                    .scan_installed()
+                    .into_iter()
+                    .filter(|item| item.view.valid)
+                    .map(|item| item.id)
+                    .collect(),
+                ..Default::default()
+            };
             self.write_state(&state)?;
             return Ok(state);
         }

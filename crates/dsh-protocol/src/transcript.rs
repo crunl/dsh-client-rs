@@ -101,6 +101,9 @@ impl MessageId {
 
 /// 时间线里的一行。
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Tool 变体承载完整工具回执（多个 String/Value + 大字段），确实比正文变体大；
+// 但把它 Box 化会波及 15+ 构造/匹配点，且单条回执已受 DETAIL_LIMIT 约束。
+#[allow(clippy::large_enum_variant)]
 pub enum Entry {
     /// 用户提问。
     User {
