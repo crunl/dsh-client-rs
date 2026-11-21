@@ -18,14 +18,15 @@ mod cache;
 mod host;
 mod host_settings;
 mod instance;
+mod model_settings;
 mod runtime;
 
 use runtime::{RuntimeControl, RuntimeRequest, RuntimeStore};
 
 use dsh_client_ui::completion;
 use dsh_client_ui::{
-    CompletionItem, EffortOption, HostLifecycle, ModelGroup, ModelOption, PresetInfo,
-    SelectedModel, SessionInfo, SidebarPrefs, UiCommand, UiEvent,
+    CompletionItem, DiscoveredChoice, EffortOption, HostLifecycle, ModelGroup, ModelOption,
+    PresetInfo, ProviderSetting, SelectedModel, SessionInfo, SidebarPrefs, UiCommand, UiEvent,
 };
 use dsh_host::{Connection, FollowStream};
 use dsh_protocol::catalog::{ModelCatalog, PermissionCatalog};
@@ -358,6 +359,7 @@ async fn host_loop(
     load_chat_verbosity(&conn, &events, first.as_ref()).await;
     load_presets(&conn, &events).await;
     load_models(&conn, &events).await;
+    refresh_model_settings(&conn, &events).await;
     let mut known = refresh_sessions(&conn, &events, None).await;
     let mut active: Option<ActiveSession> = None;
 
@@ -630,6 +632,115 @@ async fn host_loop(
                 previous,
             } => {
                 write_chat_verbosity(&conn, &events, verbosity, previous).await;
+            }
+            UiCommand::AddProvider {
+                route,
+                display_name,
+                api,
+                base_url,
+                api_key,
+                model_ids,
+            } => {
+                let snapshot = model_settings::describe(&conn).await;
+                let result: Result<(), String> = async {
+                    let snapshot = snapshot?;
+                    if !snapshot.writable {
+                        return Err("host profile 不接受设置写入".to_owned());
+                    }
+                    // 先存 key 再写 profile：写 profile 失败只残留一个未引用的 key（无害）；
+                    // 反过来会落盘一个「已配置却无凭据」的 provider，UI 还没有编辑入口修。
+                    let with_key = !api_key.is_empty();
+                    if with_key {
+                        model_settings::store_credential(&conn, &route, &api_key).await?;
+                    }
+                    let base = dsh_protocol::models::ProviderProfile {
+                        api,
+                        base_url: (!base_url.is_empty()).then_some(base_url),
+                        // 留空 key 时不写一个用户看不见的引用名，否则请求会以
+                        // MISSING_CREDENTIAL 失败；留空即走已存凭据或环境变量。
+                        api_key_env: with_key.then(|| model_settings::credential_ref(&route)),
+                        display_name: (!display_name.is_empty()).then_some(display_name),
+                        models: Vec::new(),
+                    };
+                    let profile = model_settings::append_models(&base, &model_ids);
+                    model_settings::write_provider(&conn, &route, &profile, snapshot.revision)
+                        .await?;
+                    Ok(())
+                }
+                .await;
+                match result {
+                    Ok(()) => tracing::info!(%route, "已添加 provider"),
+                    Err(error) => {
+                        let _ = events
+                            .send(UiEvent::Failed(format!("添加 provider 失败: {error}")))
+                            .await;
+                    }
+                }
+                refresh_model_settings(&conn, &events).await;
+            }
+            UiCommand::RemoveProvider { route } => {
+                let snapshot = model_settings::describe(&conn).await;
+                let result: Result<(), String> = async {
+                    let snapshot = snapshot?;
+                    model_settings::remove_provider(&conn, &route, snapshot.revision).await?;
+                    // 凭据删除失败不阻断 profile 删除：它只是残留一个未引用的 key。
+                    if let Err(error) = model_settings::remove_credential(&conn, &route).await {
+                        tracing::warn!(%error, %route, "删除凭据失败（profile 已删）");
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = result {
+                    let _ = events
+                        .send(UiEvent::Failed(format!("删除 provider 失败: {error}")))
+                        .await;
+                }
+                refresh_model_settings(&conn, &events).await;
+            }
+            UiCommand::DiscoverModels {
+                base_url,
+                api,
+                api_key,
+                seq,
+            } => {
+                let found = model_settings::discover_models(
+                    &conn,
+                    model_settings::LLM_PI_AI_NS,
+                    &base_url,
+                    &api,
+                    &api_key,
+                )
+                .await;
+                let event = match found {
+                    Ok(models) => UiEvent::ModelDiscovery {
+                        seq,
+                        choices: models
+                            .into_iter()
+                            .map(|model| DiscoveredChoice {
+                                id: model.id,
+                                name: model.name,
+                            })
+                            .collect(),
+                        error: None,
+                    },
+                    Err(error) => UiEvent::ModelDiscovery {
+                        seq,
+                        choices: Vec::new(),
+                        error: Some(error),
+                    },
+                };
+                let _ = events.send(event).await;
+            }
+            UiCommand::AddModel { route, model_ids } => {
+                match model_settings::add_model(&conn, &route, &model_ids).await {
+                    Ok(()) => tracing::info!(%route, "已追加模型"),
+                    Err(error) => {
+                        let _ = events
+                            .send(UiEvent::Failed(format!("添加模型失败: {error}")))
+                            .await;
+                    }
+                }
+                refresh_model_settings(&conn, &events).await;
             }
             UiCommand::SetModel {
                 provider,
@@ -1373,6 +1484,91 @@ async fn load_models(conn: &Connection, events: &Sender<UiEvent>) {
         .await;
 }
 
+/// 把快照映射成 UI 行的纯函数（可单测）：目录里的 provider + 已声明但目录里没有的路由。
+fn snapshot_to_settings(snapshot: &model_settings::ModelSettingsSnapshot) -> Vec<ProviderSetting> {
+    let mut providers: Vec<ProviderSetting> = snapshot
+        .providers
+        .iter()
+        .map(|provider| {
+            let cred = snapshot.credentials.get(&provider.provider);
+            let models = snapshot
+                .configured
+                .get(&provider.provider)
+                .map(|profile| {
+                    profile
+                        .models
+                        .iter()
+                        .map(|model| model.id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            ProviderSetting {
+                id: provider.provider.clone(),
+                display_name: provider.label().to_owned(),
+                declared: provider.declared || snapshot.configured.contains_key(&provider.provider),
+                default_base_url: provider.default_base_url.clone(),
+                key_configured: cred.is_some_and(|info| info.configured),
+                key_source: cred.and_then(|info| info.source.clone()),
+                models,
+            }
+        })
+        .collect();
+    // 已声明但目录里没有的自定义路由也要显示（自定网关）。
+    for (route, profile) in &snapshot.configured {
+        if providers.iter().any(|item| item.id == *route) {
+            continue;
+        }
+        providers.push(ProviderSetting {
+            id: route.clone(),
+            display_name: profile
+                .display_name
+                .clone()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| route.clone()),
+            declared: true,
+            default_base_url: profile.base_url.clone(),
+            key_configured: snapshot
+                .credentials
+                .get(route)
+                .is_some_and(|info| info.configured),
+            key_source: snapshot
+                .credentials
+                .get(route)
+                .and_then(|info| info.source.clone()),
+            models: profile
+                .models
+                .iter()
+                .map(|model| model.id.clone())
+                .collect(),
+        });
+    }
+    providers.sort_by(|a, b| {
+        provider_rank(&a.id)
+            .cmp(&provider_rank(&b.id))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    providers
+}
+
+async fn refresh_model_settings(conn: &Connection, events: &Sender<UiEvent>) {
+    let event = match model_settings::describe(conn).await {
+        Ok(snapshot) => UiEvent::ModelSettings {
+            providers: snapshot_to_settings(&snapshot),
+            writable: snapshot.writable,
+            error: None,
+        },
+        Err(error) => {
+            tracing::warn!(%error, "读模型设置失败");
+            UiEvent::ModelSettings {
+                providers: Vec::new(),
+                writable: false,
+                error: Some(error),
+            }
+        }
+    };
+    let _ = events.send(event).await;
+}
+
 /// 官方 `orderModelProviders` 的排序键。
 fn provider_rank(provider: &str) -> u8 {
     match provider {
@@ -1410,4 +1606,124 @@ async fn load_presets(conn: &Connection, events: &Sender<UiEvent>) {
 /// 历史回放与实时流共用一个折叠器，才不会出现「刚跑完的行」与「重开后的行」两个样。
 fn transcript_from_records(records: &[serde_json::Value]) -> Vec<Entry> {
     Transcript::from_records(records).into_entries()
+}
+
+#[cfg(test)]
+mod model_settings_view_tests {
+    use super::*;
+    use dsh_protocol::models::{
+        ConfigurableProvider, CredentialInfo, ProviderModel, ProviderProfile,
+    };
+    use std::collections::HashMap;
+
+    fn provider(id: &str, declared: bool) -> ConfigurableProvider {
+        ConfigurableProvider {
+            provider: id.to_owned(),
+            display_name: format!("Name-{id}"),
+            settings_ns: "llm-pi-ai".to_owned(),
+            settings_path: vec!["providers".to_owned(), id.to_owned()],
+            declared,
+            default_base_url: None,
+            base_url_env: vec![],
+        }
+    }
+
+    #[test]
+    fn maps_directory_and_marks_declared_and_credentials() {
+        let mut credentials = HashMap::new();
+        credentials.insert(
+            "acme".to_owned(),
+            CredentialInfo {
+                configured: true,
+                writable: true,
+                masked: None,
+                source: Some("file".to_owned()),
+            },
+        );
+        let mut configured = HashMap::new();
+        configured.insert(
+            "acme".to_owned(),
+            ProviderProfile {
+                api: "openai-completions".to_owned(),
+                base_url: None,
+                api_key_env: None,
+                display_name: None,
+                models: vec![ProviderModel {
+                    id: "m1".to_owned(),
+                    ..ProviderModel::default()
+                }],
+            },
+        );
+        let snapshot = model_settings::ModelSettingsSnapshot {
+            providers: vec![
+                provider("deepseek-official", false),
+                provider("acme", false),
+            ],
+            configured,
+            credentials,
+            revision: 3,
+            writable: true,
+        };
+        let rows = snapshot_to_settings(&snapshot);
+        // DeepSeek 排前，acme 排后（provider_rank）。
+        assert_eq!(rows[0].id, "deepseek-official");
+        assert_eq!(rows[1].id, "acme");
+        assert!(rows[0].display_name.starts_with("Name-"));
+        assert!(!rows[0].declared);
+        assert!(rows[1].declared, "profile 里已写入 → 标记为已配置");
+        assert!(rows[1].key_configured);
+        assert_eq!(rows[1].key_source.as_deref(), Some("file"));
+        assert_eq!(rows[1].models, ["m1"]);
+    }
+
+    #[test]
+    fn includes_configured_route_missing_from_directory() {
+        let mut configured = HashMap::new();
+        configured.insert(
+            "my-gateway".to_owned(),
+            ProviderProfile {
+                api: "openai-completions".to_owned(),
+                base_url: Some("https://my/v1".to_owned()),
+                api_key_env: None,
+                display_name: Some("My GW".to_owned()),
+                models: vec![],
+            },
+        );
+        let snapshot = model_settings::ModelSettingsSnapshot {
+            providers: vec![],
+            configured,
+            credentials: HashMap::new(),
+            revision: 0,
+            writable: true,
+        };
+        let rows = snapshot_to_settings(&snapshot);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "my-gateway");
+        assert_eq!(rows[0].display_name, "My GW");
+        assert_eq!(rows[0].default_base_url.as_deref(), Some("https://my/v1"));
+        assert!(rows[0].declared);
+    }
+
+    #[test]
+    fn blank_display_name_falls_back_to_route() {
+        let mut configured = HashMap::new();
+        configured.insert(
+            "gw".to_owned(),
+            ProviderProfile {
+                api: "openai-completions".to_owned(),
+                base_url: None,
+                api_key_env: None,
+                display_name: Some(String::new()),
+                models: vec![],
+            },
+        );
+        let snapshot = model_settings::ModelSettingsSnapshot {
+            providers: vec![],
+            configured,
+            credentials: HashMap::new(),
+            revision: 0,
+            writable: true,
+        };
+        assert_eq!(snapshot_to_settings(&snapshot)[0].display_name, "gw");
+    }
 }

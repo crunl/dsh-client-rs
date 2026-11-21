@@ -17,19 +17,20 @@ use crate::markdown::TextRole;
 use crate::settings::{ChatVerbosity, RenderPolicy, Settings};
 use crate::theme;
 use crate::{
-    CompletionItem, CtxMeter, EffortOption, HostLifecycle, ModelGroup, PresetInfo, SelectedModel,
-    SessionInfo, SidebarPrefs, UiCommand, UiEvent,
+    CompletionItem, CtxMeter, DiscoveredChoice, EffortOption, HostLifecycle, ModelGroup,
+    PresetInfo, ProviderSetting, SelectedModel, SessionInfo, SidebarPrefs, UiCommand, UiEvent,
 };
 use dsh_protocol::context::Occupancy;
 use dsh_protocol::transcript::ToolStatus;
 use dsh_protocol::{ChatTimeline, RenderId, TimelineRow, ToolFamily, ToolResultView, ToolView};
 use gpui_kit::assets::IconName;
 
-/// 设置模式的两个应用级视图：偏好与归档会话。
+/// 设置模式的三个应用级视图：偏好、模型与归档会话。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum SettingsTab {
     #[default]
     General,
+    Models,
     Archive,
 }
 
@@ -70,6 +71,30 @@ pub struct Chat {
     settings_tab: SettingsTab,
     /// 设置树分组的展开状态：key 为 `prefs` / `sessions`。缺省展开。
     settings_tree: HashMap<String, bool>,
+    /// 模型设置页：可配置 provider 的快照。
+    model_settings: Vec<ProviderSetting>,
+    /// 模型设置页读取失败说明；成功为 `None`。
+    model_settings_error: Option<String>,
+    /// 模型设置页 profile 是否可写。
+    model_settings_writable: bool,
+    /// 添加 provider 表单是否展开。
+    model_add_open: bool,
+    /// 表单字段：路由 id / 显示名 / 网关地址 / API key / 初始模型。
+    model_form_route: Entity<TextareaState>,
+    model_form_name: Entity<TextareaState>,
+    model_form_url: Entity<TextareaState>,
+    model_form_key: Entity<TextareaState>,
+    model_form_models: Entity<TextareaState>,
+    /// 正在给哪个 provider 追加模型（Some = 展开模型输入行）。
+    model_add_model_for: Option<String>,
+    /// 追加模型的输入（共享一个）。
+    model_add_model_input: Entity<TextareaState>,
+    /// 线协议家族（下拉用简单按钮轮转）。
+    model_form_api: String,
+    /// 探活请求序号与最近一次结果。
+    model_discover_seq: u64,
+    model_discover_choices: Vec<DiscoveredChoice>,
+    model_discover_error: Option<String>,
     /// 每个工具行正文的开合覆盖；单个工具正文始终是手动展开。
     tool_open: HashMap<String, bool>,
     /// 每个 reasoning 块的正文开合覆盖；会话内状态，不写设置。
@@ -275,7 +300,45 @@ const COMPLETION_DEBOUNCE_MS: u64 = 130;
 /// 浮层最多显示几行候选。
 const COMPLETION_ROWS: usize = 8;
 
+/// 设置页表单用的单行输入：共享深色样式，Enter 不提交（提交走明确的按钮）。
+fn form_input(
+    placeholder: &'static str,
+    window: &mut Window,
+    cx: &mut Context<Chat>,
+) -> Entity<TextareaState> {
+    cx.new(|cx| {
+        let mut state = TextareaState::new(window, cx)
+            .placeholder(placeholder)
+            .submit_on_enter(false);
+        state.set_editor_style(InputEditorStyle {
+            foreground: rgb(theme::INK).into(),
+            muted_foreground: rgb(theme::INK_MUTED).into(),
+            background: rgb(theme::BG_CARD).into(),
+            border: rgb(theme::BG_CARD_EDGE).into(),
+            selection: rgb(theme::INK_SOFT).into(),
+            caret: rgb(theme::INK).into(),
+            ..InputEditorStyle::default()
+        });
+        cx.notify();
+        state
+    })
+}
+
 impl Chat {
+    /// 清空添加 provider 表单的明文输入（API key 不留驻 UI 状态）。
+    fn clear_model_form(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.model_form_route
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.model_form_name
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.model_form_url
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.model_form_key
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.model_form_models
+            .update(cx, |state, cx| state.set_value("", window, cx));
+    }
+
     /// 建视图并接上事件泵。
     pub fn new(
         window: &mut Window,
@@ -305,6 +368,14 @@ impl Chat {
             cx.notify();
             state
         });
+
+        // 模型设置页的 add-provider 表单输入。构造时不聚焦，避免抢 composer 的光标。
+        let model_form_route = form_input("路由 id，如 acme-gateway", window, cx);
+        let model_form_name = form_input("显示名（可留空）", window, cx);
+        let model_form_url = form_input("https://gateway.example/v1", window, cx);
+        let model_form_key = form_input("API key（可留空，走环境变量）", window, cx);
+        let model_form_models = form_input("初始模型 id，多个用逗号分隔", window, cx);
+        let model_add_model_input = form_input("模型 id，多个用逗号分隔", window, cx);
 
         // 不聚焦就没有插入符：输入框只在获焦时闪烁光标。
         // 构造时窗口还没上屏，聚焦会被丢弃，所以首帧后再补一次；
@@ -417,6 +488,21 @@ impl Chat {
             settings_open: false,
             settings_tab: SettingsTab::default(),
             settings_tree: HashMap::new(),
+            model_settings: Vec::new(),
+            model_settings_error: None,
+            model_settings_writable: false,
+            model_add_open: false,
+            model_form_route,
+            model_form_name,
+            model_form_url,
+            model_form_key,
+            model_form_models,
+            model_add_model_for: None,
+            model_add_model_input,
+            model_form_api: "openai-completions".to_owned(),
+            model_discover_seq: 0,
+            model_discover_choices: Vec::new(),
+            model_discover_error: None,
             tool_open: HashMap::new(),
             reasoning_open: HashMap::new(),
             debug_tools_open: std::env::var("DSH_DEBUG_TOOL_OPEN").is_ok(),
@@ -630,6 +716,26 @@ impl Chat {
                 self.model_failures = failures;
                 if let Some(model) = self.debug_model.clone() {
                     self.apply_debug_model(&model);
+                }
+            }
+            UiEvent::ModelSettings {
+                providers,
+                writable,
+                error,
+            } => {
+                self.model_settings = providers;
+                self.model_settings_writable = writable;
+                self.model_settings_error = error;
+            }
+            UiEvent::ModelDiscovery {
+                seq,
+                choices,
+                error,
+            } => {
+                // 丢掉过期结果：只有最新一次探活才配得上当前表单。
+                if seq == self.model_discover_seq {
+                    self.model_discover_choices = choices;
+                    self.model_discover_error = error;
                 }
             }
             UiEvent::Transcript(items) => {
@@ -994,6 +1100,13 @@ impl Chat {
                 SettingsTab::General,
                 "聊天 · 详略",
                 "全局详略；控制 reasoning 与工具过程的默认显示",
+                cx,
+            )));
+            body = body.child(div().pl(px(22.)).child(self.settings_tree_leaf(
+                "settings-nav:models",
+                SettingsTab::Models,
+                "模型",
+                "provider 与模型；添加网关或自定模型",
                 cx,
             )));
         }
@@ -2036,6 +2149,519 @@ impl Chat {
             )
     }
 
+    /// 模型设置页：可配置 provider 列表 + 添加自定义网关表单。
+    fn model_settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut list = div().flex().flex_col().gap_1();
+        if self.model_settings.is_empty() {
+            list = list.child(
+                div()
+                    .text_size(px(theme::META))
+                    .text_color(rgb(theme::INK_MUTED))
+                    .child(if self.model_settings_error.is_some() {
+                        "模型设置读取失败，见下方说明"
+                    } else {
+                        "没有可配置的 provider"
+                    }),
+            );
+        }
+        for provider in &self.model_settings {
+            list = list.child(self.model_provider_row(provider, cx));
+        }
+
+        let add = if self.model_add_open {
+            self.model_add_form(cx).into_any_element()
+        } else {
+            let toggle = cx.entity();
+            div()
+                .id("model-add-toggle")
+                .flex()
+                .flex_row()
+                .items_center()
+                .px(px(12.))
+                .py(px(8.))
+                .rounded(px(6.))
+                .bg(rgb(theme::BG_HOVER))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(theme::BG_CARD_EDGE)))
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    toggle.update(cx, |chat: &mut Self, cx| {
+                        chat.model_add_open = true;
+                        cx.notify();
+                    });
+                })
+                .child(
+                    div()
+                        .text_size(px(theme::UI))
+                        .text_color(rgb(theme::INK))
+                        .child("＋ 添加 provider"),
+                )
+                .into_any_element()
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
+            .child(
+            div()
+                .id("model-settings-scroll")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .w_full()
+                .max_w(px(theme::CONTENT_W))
+                .mx_auto()
+                .px(px(theme::GUTTER))
+                .py(px(theme::GUTTER))
+                .gap_5()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(px(theme::BODY))
+                                .text_color(rgb(theme::INK))
+                                .child("模型"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(theme::META))
+                                .text_color(rgb(theme::INK_MUTED))
+                                .child(
+                                    "provider 与模型；密钥只写 .credentials.yaml，profile 只留引用",
+                                ),
+                        ),
+                )
+                .child(list)
+                .child(self.model_add_model_row(cx))
+                .child(add)
+                .child(if let Some(error) = self.model_settings_error.as_deref() {
+                    div()
+                        .text_size(px(theme::META))
+                        .text_color(rgb(theme::INK_SOFT))
+                        .child(format!("读取失败：{error}"))
+                        .into_any_element()
+                } else if !self.model_settings_writable {
+                    div()
+                        .text_size(px(theme::META))
+                        .text_color(rgb(theme::INK_SOFT))
+                        .child("当前 profile 不接受设置写入")
+                        .into_any_element()
+                } else {
+                    div().into_any_element()
+                }),
+        )
+    }
+
+    /// 模型设置页里的一行 provider。
+    fn model_provider_row(
+        &self,
+        provider: &ProviderSetting,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let remove = cx.entity();
+        let add_model = cx.entity();
+        let route = provider.id.clone();
+        let route_add = provider.id.clone();
+        let mut detail = format!(
+            "{} · ",
+            if provider.declared {
+                "已配置"
+            } else {
+                "可添加"
+            }
+        );
+        detail.push_str(if provider.key_configured {
+            provider.key_source.as_deref().unwrap_or("凭据已配置")
+        } else {
+            "无凭据"
+        });
+        if !provider.models.is_empty() {
+            detail.push_str(&format!(" · {} 个模型", provider.models.len()));
+        }
+        div()
+            .id(ElementId::Name(
+                format!("model-provider:{}", provider.id).into(),
+            ))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .px(px(12.))
+            .py(px(8.))
+            .rounded(px(6.))
+            .bg(rgb(theme::BG_CARD))
+            .border_1()
+            .border_color(rgb(theme::BG_CARD_EDGE))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .flex_1()
+                    .child(
+                        div()
+                            .text_size(px(theme::UI))
+                            .text_color(rgb(theme::INK))
+                            .child(provider.display_name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme::META))
+                            .text_color(rgb(theme::INK_MUTED))
+                            .child(detail),
+                    ),
+            )
+            .child(if provider.declared {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .id(ElementId::Name(
+                                format!("model-provider-add-model:{}", provider.id).into(),
+                            ))
+                            .text_size(px(theme::META))
+                            .text_color(rgb(theme::INK_SOFT))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgb(theme::INK)))
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                add_model.update(cx, |chat: &mut Self, cx| {
+                                    chat.model_add_model_for = Some(route_add.clone());
+                                    cx.notify();
+                                });
+                            })
+                            .child("＋模型"),
+                    )
+                    .child(
+                        div()
+                            .id(ElementId::Name(
+                                format!("model-provider-remove:{}", provider.id).into(),
+                            ))
+                            .text_size(px(theme::META))
+                            .text_color(rgb(theme::INK_SOFT))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgb(theme::INK)))
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                let _ =
+                                    remove
+                                        .read(cx)
+                                        .commands
+                                        .try_send(UiCommand::RemoveProvider {
+                                            route: route.clone(),
+                                        });
+                            })
+                            .child("移除"),
+                    )
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            })
+    }
+
+    /// 给已声明 provider 追加模型的内联输入行（无目标时不渲染）。
+    fn model_add_model_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(route) = self.model_add_model_for.clone() else {
+            return div().into_any_element();
+        };
+        let entity_submit = cx.entity();
+        let entity_cancel = cx.entity();
+        let sender = self.commands.clone();
+        let input = self.model_add_model_input.clone();
+        let route_submit = route.clone();
+        div()
+            .id("model-add-model-row")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p(px(12.))
+            .rounded(px(6.))
+            .bg(rgb(theme::BG_CARD))
+            .border_1()
+            .border_color(rgb(theme::BG_CARD_EDGE))
+            .child(
+                div()
+                    .text_size(px(theme::META))
+                    .text_color(rgb(theme::INK_SOFT))
+                    .child(format!("给 {route} 添加模型")),
+            )
+            .child(div().child(Textarea::new(&input)))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .id("model-add-model-submit")
+                            .text_size(px(theme::UI))
+                            .text_color(rgb(theme::INK))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(theme::BG_HOVER)))
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                let ids = input.read(cx).value().to_string();
+                                if !ids.trim().is_empty() {
+                                    let _ = sender.try_send(UiCommand::AddModel {
+                                        route: route_submit.clone(),
+                                        model_ids: ids,
+                                    });
+                                }
+                                entity_submit.update(cx, |chat: &mut Self, cx| {
+                                    chat.model_add_model_input
+                                        .update(cx, |state, cx| state.set_value("", window, cx));
+                                    chat.model_add_model_for = None;
+                                    cx.notify();
+                                });
+                            })
+                            .child("添加"),
+                    )
+                    .child(
+                        div()
+                            .id("model-add-model-cancel")
+                            .text_size(px(theme::UI))
+                            .text_color(rgb(theme::INK_SOFT))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgb(theme::INK)))
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                entity_cancel.update(cx, |chat: &mut Self, cx| {
+                                    chat.model_add_model_input
+                                        .update(cx, |state, cx| state.set_value("", window, cx));
+                                    chat.model_add_model_for = None;
+                                    cx.notify();
+                                });
+                            })
+                            .child("取消"),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 添加 provider 表单。字段从 4 个 TextareaState 读，提交走 UiCommand。
+    fn model_add_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity_api = cx.entity();
+        let entity_discover = cx.entity();
+        let sender_probe = self.commands.clone();
+        let route = self.model_form_route.clone();
+        let name = self.model_form_name.clone();
+        let url = self.model_form_url.clone();
+        let url_probe = url.clone();
+        let key = self.model_form_key.clone();
+        let key_probe = key.clone();
+        let models_input = self.model_form_models.clone();
+        let api = self.model_form_api.clone();
+        let api_probe = api.clone();
+        let seq = self.model_discover_seq + 1;
+
+        let field = |label: &'static str, input: Entity<TextareaState>| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(theme::META))
+                        .text_color(rgb(theme::INK_SOFT))
+                        .child(label),
+                )
+                .child(div().child(Textarea::new(&input)))
+        };
+
+        let mut form = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p(px(12.))
+            .rounded(px(10.))
+            .bg(rgb(theme::BG_CARD))
+            .border_1()
+            .border_color(rgb(theme::BG_CARD_EDGE))
+            .child(field("路由 id", route.clone()))
+            .child(field("显示名", name.clone()))
+            .child(
+                div().flex().flex_row().items_center().gap_2().child(
+                    div()
+                        .id("model-form-api")
+                        .text_size(px(theme::META))
+                        .text_color(rgb(theme::INK))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(theme::BG_HOVER)))
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            entity_api.update(cx, |chat: &mut Self, cx| {
+                                chat.model_form_api = chat.next_api();
+                                cx.notify();
+                            });
+                        })
+                        .child(format!("协议：{api} ⇄")),
+                ),
+            )
+            .child(field("网关地址", url.clone()))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(field("API key", key.clone()).into_any_element())
+                    .child(
+                        div()
+                            .id("model-form-discover")
+                            .flex_none()
+                            .text_size(px(theme::META))
+                            .text_color(rgb(theme::INK_SOFT))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgb(theme::INK)))
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                let base = url_probe.read(cx).value().to_string();
+                                if base.is_empty() {
+                                    return;
+                                }
+                                let _ = sender_probe.try_send(UiCommand::DiscoverModels {
+                                    base_url: base,
+                                    api: api_probe.clone(),
+                                    api_key: key_probe.read(cx).value().to_string(),
+                                    seq,
+                                });
+                                entity_discover.update(cx, |chat, cx| {
+                                    chat.model_discover_seq = seq;
+                                    chat.model_discover_choices.clear();
+                                    chat.model_discover_error = None;
+                                    cx.notify();
+                                });
+                            })
+                            .child("探测模型"),
+                    ),
+            )
+            .child(field(
+                "初始模型 id（逗号分隔，可留空）",
+                models_input.clone(),
+            ));
+
+        if let Some(error) = self.model_discover_error.as_deref() {
+            form = form.child(
+                div()
+                    .text_size(px(theme::META))
+                    .text_color(rgb(theme::INK_SOFT))
+                    .child(format!("探测失败：{error}")),
+            );
+        } else if !self.model_discover_choices.is_empty() {
+            let choices = self
+                .model_discover_choices
+                .iter()
+                .take(40)
+                .map(|choice| {
+                    choice
+                        .name
+                        .as_deref()
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or(&choice.id)
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            form = form.child(
+                div()
+                    .text_size(px(theme::META))
+                    .text_color(rgb(theme::INK_MUTED))
+                    .child(format!("可用模型：{choices}")),
+            );
+        }
+
+        let submit = cx.entity();
+        let cancel = cx.entity();
+        let sender2 = self.commands.clone();
+        let route2 = route.clone();
+        let name2 = name.clone();
+        let url2 = url.clone();
+        let key2 = key.clone();
+        let api2 = api.clone();
+        let models2 = models_input.clone();
+        form.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .id("model-form-submit")
+                        .text_size(px(theme::UI))
+                        .text_color(rgb(theme::INK))
+                        .px(px(12.))
+                        .py(px(6.))
+                        .rounded(px(6.))
+                        .bg(rgb(theme::BG_HOVER))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(theme::BG_CARD_EDGE)))
+                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                            let values = (
+                                route2.read(cx).value().to_string(),
+                                name2.read(cx).value().to_string(),
+                                api2.clone(),
+                                url2.read(cx).value().to_string(),
+                                key2.read(cx).value().to_string(),
+                                models2.read(cx).value().to_string(),
+                            );
+                            let _ = sender2.try_send(UiCommand::AddProvider {
+                                route: values.0,
+                                display_name: values.1,
+                                api: values.2,
+                                base_url: values.3,
+                                api_key: values.4,
+                                model_ids: values.5,
+                            });
+                            submit.update(cx, |chat: &mut Self, cx| {
+                                chat.clear_model_form(window, cx);
+                                chat.model_add_open = false;
+                                cx.notify();
+                            });
+                        })
+                        .child("保存"),
+                )
+                .child(
+                    div()
+                        .id("model-form-cancel")
+                        .text_size(px(theme::UI))
+                        .text_color(rgb(theme::INK_SOFT))
+                        .px(px(12.))
+                        .py(px(6.))
+                        .cursor_pointer()
+                        .hover(|style| style.text_color(rgb(theme::INK)))
+                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                            cancel.update(cx, |chat: &mut Self, cx| {
+                                chat.clear_model_form(window, cx);
+                                chat.model_add_open = false;
+                                cx.notify();
+                            });
+                        })
+                        .child("取消"),
+                ),
+        )
+    }
+
+    /// 协议家族轮转（简单按钮切换到下一个）。
+    fn next_api(&self) -> String {
+        const APIS: [&str; 4] = [
+            "openai-completions",
+            "openai-responses",
+            "anthropic-messages",
+            "google-generative-ai",
+        ];
+        let index = APIS
+            .iter()
+            .position(|item| *item == self.model_form_api)
+            .unwrap_or(0);
+        APIS[(index + 1) % APIS.len()].to_owned()
+    }
+
     /// 归档 Tab：恢复走 host `unarchiveSession`，删除只是本客户端移除（host 无删会话 API）。
     fn archive_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let archived = self.archived_sessions();
@@ -2191,6 +2817,7 @@ impl Chat {
         let body = if self.settings_open {
             match self.settings_tab {
                 SettingsTab::General => self.settings_page(cx).into_any_element(),
+                SettingsTab::Models => self.model_settings_page(cx).into_any_element(),
                 SettingsTab::Archive => self.archive_page(cx).into_any_element(),
             }
         } else if self.active_session.is_empty() {

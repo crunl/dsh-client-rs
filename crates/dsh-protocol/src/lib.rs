@@ -13,6 +13,7 @@ pub mod commands;
 pub mod context;
 pub mod files;
 pub mod fold;
+pub mod models;
 pub mod session;
 pub mod settings;
 pub mod stream;

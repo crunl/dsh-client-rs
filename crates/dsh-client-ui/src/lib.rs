@@ -117,6 +117,34 @@ pub struct SelectedModel {
     pub effort: Option<String>,
 }
 
+/// 模型设置页里一个 provider 的展示信息（UI 层纯数据，不碰 serde）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderSetting {
+    /// provider 路由 id。
+    pub id: String,
+    /// 显示名。
+    pub display_name: String,
+    /// 是否已配置（目录标记 declared，或 profile 里已有声明）。
+    pub declared: bool,
+    /// 默认 base URL（自定义网关时的占位提示）。
+    pub default_base_url: Option<String>,
+    /// 凭据是否已配置。
+    pub key_configured: bool,
+    /// 凭据来源（env / file），用于提示用户去哪设。
+    pub key_source: Option<String>,
+    /// 已声明的模型 id 列表。
+    pub models: Vec<String>,
+}
+
+/// 探活返回的一个候选模型（UI 层纯数据）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscoveredChoice {
+    /// 模型 id。
+    pub id: String,
+    /// 显示名。
+    pub name: Option<String>,
+}
+
 /// 一个权限 preset（composer 左侧 mode 的候选项）。
 #[derive(Debug, Clone)]
 pub struct PresetInfo {
@@ -193,6 +221,24 @@ pub enum UiEvent {
         /// 提供方级故障（已按官方文案格式化，如「DeepSeek 加载失败：…」）。
         /// 必须渲染，否则「有凭据但列举失败」会表现成「什么都没配」。
         failures: Vec<String>,
+    },
+    /// 模型设置页的快照（进入设置 / 写操作后刷新）。
+    ModelSettings {
+        /// 可配置 provider 的展示行。
+        providers: Vec<ProviderSetting>,
+        /// profile 是否可写。
+        writable: bool,
+        /// 读取失败说明；成功为 `None`。
+        error: Option<String>,
+    },
+    /// `llm/discoverModels` 探活结果，按请求序号回程。
+    ModelDiscovery {
+        /// 请求序号，丢弃过期结果。
+        seq: u64,
+        /// 候选模型；失败时为空。
+        choices: Vec<DiscoveredChoice>,
+        /// 探活失败说明。
+        error: Option<String>,
     },
     /// 一条流式帧，界面自己折叠。
     Frame(AssistantStreamFrame),
@@ -285,6 +331,44 @@ pub enum UiCommand {
         /// 点击前生效的档位，写失败时 UI 用它回滚。
         previous: ChatVerbosity,
     },
+    /// 添加一个自定义 provider（写 profile + 可选存 key）。
+    AddProvider {
+        /// 路由 id（小写字母/数字/连字符）。
+        route: String,
+        /// 显示名。
+        display_name: String,
+        /// 线协议家族。
+        api: String,
+        /// 网关地址。
+        base_url: String,
+        /// API key 真值；留空表示不存（用环境变量或已有凭据）。
+        api_key: String,
+        /// 初始模型 id，逗号分隔（可留空，之后再用 AddModel 加）。
+        model_ids: String,
+    },
+    /// 删除一个自定义 provider（删 profile 声明 + 删它的凭据）。
+    RemoveProvider {
+        /// 路由 id。
+        route: String,
+    },
+    /// 探活网关能列出哪些模型。
+    DiscoverModels {
+        /// 要探活的 base URL。
+        base_url: String,
+        /// 线协议家族。
+        api: String,
+        /// 一次性 key 真值；留空表示不传。
+        api_key: String,
+        /// 请求序号，回程原样带回。
+        seq: u64,
+    },
+    /// 给一个自定义 provider 追加模型（读当前 profile → 追加 → 写回）。
+    AddModel {
+        /// provider 路由 id。
+        route: String,
+        /// 模型 id（逗号分隔可一次加多个）。
+        model_ids: String,
+    },
 }
 
 impl UiCommand {
@@ -304,6 +388,10 @@ impl UiCommand {
             Self::Complete { .. } => "Complete",
             Self::SetModel { .. } => "SetModel",
             Self::SetChatVerbosity { .. } => "SetChatVerbosity",
+            Self::AddProvider { .. } => "AddProvider",
+            Self::RemoveProvider { .. } => "RemoveProvider",
+            Self::DiscoverModels { .. } => "DiscoverModels",
+            Self::AddModel { .. } => "AddModel",
         }
     }
 }
