@@ -2496,9 +2496,7 @@ impl Chat {
         let key = row_render_id(first).label();
         let policy = self.settings.verbosity.policy();
         let running_turn = process_group_running(rows, self.phase.is_busy());
-        let header_visible = policy.group_header_visible(running_turn);
-        let open = !header_visible
-            || self.debug_tools_open
+        let open = self.debug_tools_open
             || self
                 .open_groups
                 .get(&key)
@@ -2506,7 +2504,7 @@ impl Chat {
                 .unwrap_or_else(|| policy.group_body_open(running_turn));
 
         let mut group = div().flex().flex_col().gap_1();
-        if header_visible {
+        {
             let toggle = cx.entity();
             let toggle_key = key.clone();
             let header = div()
@@ -2578,7 +2576,7 @@ impl Chat {
         let policy = self.settings.verbosity.policy();
         let key = id.label();
         let open = self.debug_tools_open || self.reasoning_open.get(&key).copied().unwrap_or(false);
-        let preview = reasoning_preview(text, streaming, policy);
+        let preview = reasoning_summary(text, streaming, policy);
         let entity = cx.entity();
         let toggle_key = key.clone();
 
@@ -3577,7 +3575,7 @@ fn render_row(row: &TimelineRow) -> AnyElement {
     }
 }
 
-/// 组头文案：类别摘要，运行中按档位加一句实时提示。
+/// 组头文案：一行类别统计；运行中按档位换成最后一条工具的实时摘要。
 fn group_label(policy: RenderPolicy, rows: &[TimelineRow], running: bool) -> String {
     let tools: Vec<&ToolView> = rows
         .iter()
@@ -3586,26 +3584,30 @@ fn group_label(policy: RenderPolicy, rows: &[TimelineRow], running: bool) -> Str
             _ => None,
         })
         .collect();
-    let mut kinds: Vec<&str> = Vec::new();
+    if tools.is_empty() {
+        return if running { "思考中" } else { "已思考" }.to_owned();
+    }
+    if policy.show_live_summary(running)
+        && let Some(last) = tools.last()
+        && !last.title.is_empty()
+    {
+        return last.title.clone();
+    }
+    let mut counts: Vec<(&str, usize)> = Vec::new();
     for tool in &tools {
         let kind = tool.family.category();
-        if !kinds.contains(&kind) {
-            kinds.push(kind);
+        match counts.iter_mut().find(|(name, _)| *name == kind) {
+            Some(entry) => entry.1 += 1,
+            None => counts.push((kind, 1)),
         }
     }
-    kinds.truncate(3);
-    let summary = if kinds.is_empty() {
-        if running { "分析中" } else { "分析完成" }.to_owned()
-    } else {
-        kinds.join(" · ")
-    };
-    if policy.show_running_hint(running)
-        && let Some(last) = tools.last()
-        && last.status == ToolStatus::Running
-    {
-        return format!("{summary} · 正在跑 {}", last.name);
-    }
-    summary
+    counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    counts.truncate(3);
+    counts
+        .into_iter()
+        .map(|(name, count)| format!("{name} {count}"))
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// 行的稳定渲染身份；过程组用它做会话内开合键。
@@ -3652,35 +3654,20 @@ fn process_group_running(rows: &[TimelineRow], session_busy: bool) -> bool {
         })
 }
 
-/// reasoning 折叠态的预览。
+/// reasoning 折叠态的一行摘要。
 ///
-/// 流式时与官方一致：只取「首行已换行」的最后一段，未写完的单行不给预览；
-/// 已落定时 Compact 不显示预览，其余档位显示首行。正文始终是纯文本。
-fn reasoning_preview(text: &str, streaming: bool, policy: RenderPolicy) -> String {
-    if streaming {
-        let paragraphs: Vec<&str> = text.split("\n\n").collect();
-        return paragraphs
-            .into_iter()
-            .rev()
-            .find_map(|paragraph| {
-                if !paragraph.contains('\n') {
-                    return None;
-                }
-                paragraph
-                    .lines()
-                    .next()
-                    .map(|line| line.trim().to_owned())
-                    .filter(|line| !line.is_empty())
-            })
-            .unwrap_or_default();
-    }
-    if !policy.reasoning_preview {
+/// 流式取最后一行非空文本（首行往往是开场白，信息量最低），已落定取首行；
+/// Low 档两种都不给摘要。正文始终是纯文本，不解析 markdown。
+fn reasoning_summary(text: &str, streaming: bool, policy: RenderPolicy) -> String {
+    if !policy.show_reasoning_summary() {
         return String::new();
     }
-    text.lines()
-        .next()
-        .map(|line| line.trim().to_owned())
-        .unwrap_or_default()
+    let line = if streaming {
+        text.lines().rev().find(|line| !line.trim().is_empty())
+    } else {
+        text.lines().find(|line| !line.trim().is_empty())
+    };
+    line.map(|line| line.trim().to_owned()).unwrap_or_default()
 }
 
 /// 展开区正文：审计字段 + 工具结果，永远是纯文本，不解析 markdown。
@@ -3690,12 +3677,20 @@ fn tool_body(view: &ToolView) -> String {
         .iter()
         .map(|detail| format!("{}: {}", detail.label, detail.value))
         .collect();
+    // 成功的文件读/写输出是噪声（ZCode 同样不渲染），错误与 shell/搜索类仍保留。
+    let show_text_output = match view.status {
+        ToolStatus::Error => true,
+        ToolStatus::Ok => !matches!(view.family, ToolFamily::FileRead | ToolFamily::FileWrite),
+        ToolStatus::Running => false,
+    };
     match &view.result {
         ToolResultView::None => {}
         ToolResultView::Text { text, truncated } => {
-            lines.push(text.clone());
-            if *truncated {
-                lines.push("（输出过长，只显示前一段）".to_owned());
+            if show_text_output {
+                lines.push(text.clone());
+                if *truncated {
+                    lines.push("（输出过长，只显示前一段）".to_owned());
+                }
             }
         }
         ToolResultView::Diff {
@@ -4050,8 +4045,9 @@ fn short_id(session: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatVerbosity, ModelGroup, PullRow, SelectedModel, format_tokens, group_plan, host_status,
-        leaf, model_menu_rows, process_group_running, process_runs, reasoning_preview, short_id,
+        ChatVerbosity, ModelGroup, PullRow, SelectedModel, format_tokens, group_label, group_plan,
+        host_status, leaf, model_menu_rows, process_group_running, process_runs, reasoning_summary,
+        short_id, tool_body,
     };
     use crate::{HostLifecycle, ModelOption, SessionInfo, SidebarPrefs};
     use dsh_protocol::workspace::{WorkspaceRegistry, WorkspaceView};
@@ -4229,22 +4225,73 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_preview_follows_verbosity_and_stream_state() {
+    fn reasoning_summary_follows_verbosity_and_stream_state() {
         let low = ChatVerbosity::Low.policy();
         let medium = ChatVerbosity::Medium.policy();
-        assert_eq!(reasoning_preview("第一行\n第二行", false, low), "");
-        assert_eq!(reasoning_preview("第一行\n第二行", false, medium), "第一行");
-        // 流式时未写完的单行不给预览；已换行的首行可以给。
-        assert_eq!(reasoning_preview("第一行", true, medium), "");
-        assert_eq!(reasoning_preview("第一行\n第二行", true, low), "第一行");
+        assert_eq!(reasoning_summary("第一行\n第二行", false, low), "");
+        assert_eq!(reasoning_summary("第一行\n第二行", false, medium), "第一行");
+        // 流式取最后一行非空文本，而不是开场白。
+        assert_eq!(reasoning_summary("第一行\n第二行", true, medium), "第二行");
+        assert_eq!(reasoning_summary("第一行", true, medium), "第一行");
+        assert_eq!(reasoning_summary("第一行\n第二行", true, low), "");
     }
 
     #[test]
     fn verbosity_controls_group_body_by_default() {
         assert!(!ChatVerbosity::Low.policy().group_body_open(true));
-        assert!(!ChatVerbosity::Medium.policy().group_body_open(true));
+        assert!(ChatVerbosity::Medium.policy().group_body_open(true));
+        assert!(!ChatVerbosity::Medium.policy().group_body_open(false));
         assert!(ChatVerbosity::High.policy().group_body_open(true));
-        assert!(!ChatVerbosity::High.policy().group_body_open(false));
+        assert!(ChatVerbosity::High.policy().group_body_open(false));
+    }
+
+    /// 组头把 N 条工具压成一行分类统计，运行中高亮最后一条的摘要。
+    #[test]
+    fn group_label_compresses_tools_into_one_line() {
+        let mut third = tool("t3");
+        if let TimelineRow::Tool(view) = &mut third {
+            view.family = ToolFamily::FileWrite;
+            view.title = "编辑 src/main.rs".to_owned();
+            view.status = dsh_protocol::transcript::ToolStatus::Running;
+        }
+        let rows = vec![tool("t1"), tool("t2"), third];
+        let low = group_label(ChatVerbosity::Low.policy(), &rows, true);
+        assert!(low.contains("命令 2"), "低档运行中仍给类别统计：{low}");
+
+        let medium = group_label(ChatVerbosity::Medium.policy(), &rows, true);
+        assert_eq!(medium, "编辑 src/main.rs");
+
+        let settled = group_label(ChatVerbosity::Medium.policy(), &rows, false);
+        assert!(settled.contains("编辑 1"), "分类统计带数量：{settled}");
+    }
+
+    /// 成功的文件读输出不铺进展开区；shell 成功与失败仍保留输出。
+    #[test]
+    fn tool_body_filters_successful_file_output() {
+        let mut read = tool("r1");
+        if let TimelineRow::Tool(view) = &mut read {
+            view.family = ToolFamily::FileRead;
+            view.result = ToolResultView::Text {
+                text: "大段文件内容".to_owned(),
+                truncated: false,
+            };
+        }
+        let TimelineRow::Tool(read_view) = &read else {
+            unreachable!()
+        };
+        assert!(!tool_body(read_view).contains("大段文件内容"));
+
+        let mut shell = tool("r2");
+        if let TimelineRow::Tool(view) = &mut shell {
+            view.result = ToolResultView::Text {
+                text: "命令输出".to_owned(),
+                truncated: false,
+            };
+        }
+        let TimelineRow::Tool(shell_view) = &shell else {
+            unreachable!()
+        };
+        assert!(tool_body(shell_view).contains("命令输出"));
     }
 
     fn session(id: &str, cwd: &str, updated_at: i64) -> SessionInfo {

@@ -59,9 +59,9 @@ impl ChatVerbosity {
     /// UI 说明：说清楚它实际改变什么，不写空泛的 marketing copy。
     pub const fn description(self) -> &'static str {
         match self {
-            Self::Low => "过程默认收起；reasoning 可展开但不给预览",
-            Self::Medium => "过程默认收起；显示 reasoning 首行与运行中工具详情",
-            Self::High => "运行中直接显示过程；历史过程保留可展开组头",
+            Self::Low => "过程收起为类别统计；推理不给摘要",
+            Self::Medium => "过程收起为类别统计；运行中临时展开，推理显示摘要",
+            Self::High => "过程默认展开；推理显示摘要",
         }
     }
 
@@ -84,66 +84,66 @@ impl ChatVerbosity {
         match self {
             Self::Low => RenderPolicy {
                 verbosity: self,
-                reasoning_preview: false,
-                group_header: GroupHeaderMode::Summary,
-                group_body_open_while_running: false,
+                reasoning_summary: false,
+                live_group_summary: false,
+                expand_running_group: false,
+                expand_history_group: false,
             },
             Self::Medium => RenderPolicy {
                 verbosity: self,
-                reasoning_preview: true,
-                group_header: GroupHeaderMode::SummaryWithRunningDetail,
-                group_body_open_while_running: false,
+                reasoning_summary: true,
+                live_group_summary: true,
+                expand_running_group: true,
+                expand_history_group: false,
             },
             Self::High => RenderPolicy {
                 verbosity: self,
-                reasoning_preview: true,
-                group_header: GroupHeaderMode::HistoricalOnly,
-                group_body_open_while_running: true,
+                reasoning_summary: true,
+                live_group_summary: true,
+                expand_running_group: true,
+                expand_history_group: true,
             },
         }
     }
 }
 
-/// 过程组头的显示规则。闭集，渲染层只消费它。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GroupHeaderMode {
-    /// 始终显示类别摘要；不给实时详情。
-    Summary,
-    /// 始终显示摘要；运行中额外显示实时工具详情。
-    SummaryWithRunningDetail,
-    /// 运行中隐藏组头；历史过程保留摘要。
-    HistoricalOnly,
-}
-
 /// 从 `ChatVerbosity` 派生的只读渲染策略。
 ///
-/// 这里只描述「这些行按什么详略画」。身份、顺序和内容仍由 `ChatTimeline` 决定。
+/// 三档共享同一条基线：过程默认收起成一行类别统计，推理永不灌进 assistant 正文。
+/// 档位只调四个旋钮——组头统计与实时摘要的取舍、收起推理是否给摘要、运行中与
+/// 历史过程组的默认开合。身份、顺序和内容仍由 `ChatTimeline` 决定。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderPolicy {
     /// 当前档位，只用于回显。
     pub verbosity: ChatVerbosity,
-    /// settled reasoning 是否显示首行预览。
-    pub reasoning_preview: bool,
-    /// 组头规则。
-    pub group_header: GroupHeaderMode,
-    /// 运行中的过程组是否默认直接展开。
-    pub group_body_open_while_running: bool,
+    /// 收起态 reasoning 是否给一行摘要。
+    pub reasoning_summary: bool,
+    /// 运行中组头是否用最后一条工具摘要替代类别统计。
+    pub live_group_summary: bool,
+    /// 运行中过程组是否默认展开；完成即回折，用户点选优先。
+    pub expand_running_group: bool,
+    /// 历史过程组是否默认展开。
+    pub expand_history_group: bool,
 }
 
 impl RenderPolicy {
-    /// 是否画过程组头。
-    pub const fn group_header_visible(self, running_turn: bool) -> bool {
-        !running_turn || !matches!(self.group_header, GroupHeaderMode::HistoricalOnly)
+    /// 收起态 reasoning 是否显示摘要。
+    pub const fn show_reasoning_summary(self) -> bool {
+        self.reasoning_summary
     }
 
-    /// 组头是否追加实时工具详情。
-    pub const fn show_running_hint(self, running_turn: bool) -> bool {
-        running_turn && matches!(self.group_header, GroupHeaderMode::SummaryWithRunningDetail)
+    /// 运行中组头是否显示实时工具摘要而非类别统计。
+    pub const fn show_live_summary(self, running_turn: bool) -> bool {
+        running_turn && self.live_group_summary
     }
 
     /// 过程组的默认开合；会话内的显式点选仍然优先。
     pub const fn group_body_open(self, running_turn: bool) -> bool {
-        running_turn && self.group_body_open_while_running
+        if running_turn {
+            self.expand_running_group
+        } else {
+            self.expand_history_group
+        }
     }
 }
 
@@ -161,7 +161,7 @@ pub struct Settings {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatVerbosity, GroupHeaderMode};
+    use super::ChatVerbosity;
 
     #[test]
     fn host_keys_are_official_values() {
@@ -205,29 +205,24 @@ mod tests {
         let medium = ChatVerbosity::Medium.policy();
         let high = ChatVerbosity::High.policy();
 
-        assert!(!low.reasoning_preview);
-        assert_eq!(low.group_header, GroupHeaderMode::Summary);
-        assert!(low.group_header_visible(true));
-        assert!(!low.show_running_hint(true));
+        // 共同基线：无档位把推理灌进正文，组头始终存在。
+        assert!(!low.show_reasoning_summary());
+        assert!(medium.show_reasoning_summary());
+        assert!(high.show_reasoning_summary());
+
+        // 只有中/高档在运行中把组头换成实时摘要。
+        assert!(!low.show_live_summary(true));
+        assert!(medium.show_live_summary(true));
+        assert!(!medium.show_live_summary(false));
+        assert!(high.show_live_summary(true));
+
+        // 默认开合：低档永不展开；中档运行中展开、完成回折；高档连历史也展开。
         assert!(!low.group_body_open(true));
-
-        assert!(medium.reasoning_preview);
-        assert_eq!(
-            medium.group_header,
-            GroupHeaderMode::SummaryWithRunningDetail
-        );
-        assert!(medium.group_header_visible(true));
-        assert!(medium.show_running_hint(true));
-        assert!(!medium.show_running_hint(false));
-        assert!(!medium.group_body_open(true));
-
-        assert!(high.reasoning_preview);
-        assert_eq!(high.group_header, GroupHeaderMode::HistoricalOnly);
-        assert!(!high.group_header_visible(true));
-        assert!(high.group_header_visible(false));
-        assert!(!high.show_running_hint(true));
+        assert!(!low.group_body_open(false));
+        assert!(medium.group_body_open(true));
+        assert!(!medium.group_body_open(false));
         assert!(high.group_body_open(true));
-        assert!(!high.group_body_open(false));
+        assert!(high.group_body_open(false));
     }
 
     #[test]
