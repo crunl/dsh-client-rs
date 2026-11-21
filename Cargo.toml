@@ -26,7 +26,7 @@ dsh-client-ui = { path = "crates/dsh-client-ui" }
 # 不依赖 gpui-shell（见 DECISIONS #6）。
 # 默认这里关掉 features：控件库（component）与图标资产（assets）由各 crate 显式
 # 开启，好让「关掉它们能省多少内存」成为可测的开关而不是信念。
-gpui-kit = { version = "0.9.1", default-features = false }
+gpui-kit = { version = "0.10.0", default-features = false }
 
 # ── 序列化 ────────────────────────────────────────────────────────────────
 serde = { version = "1", features = ["derive"] }
