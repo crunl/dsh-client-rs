@@ -66,8 +66,10 @@ pub struct Chat {
     settings_saved: bool,
     /// settings 页面是否覆盖主区。
     settings_open: bool,
-    /// 设置模式当前 Tab。
+    /// 设置模式当前选中的叶子（偏好→聊天 / 会话→归档）。
     settings_tab: SettingsTab,
+    /// 设置树分组的展开状态：key 为 `prefs` / `sessions`。缺省展开。
+    settings_tree: HashMap<String, bool>,
     /// 每个工具行正文的开合覆盖；单个工具正文始终是手动展开。
     tool_open: HashMap<String, bool>,
     /// 每个 reasoning 块的正文开合覆盖；会话内状态，不写设置。
@@ -414,6 +416,7 @@ impl Chat {
             settings_saved: false,
             settings_open: false,
             settings_tab: SettingsTab::default(),
+            settings_tree: HashMap::new(),
             tool_open: HashMap::new(),
             reasoning_open: HashMap::new(),
             debug_tools_open: std::env::var("DSH_DEBUG_TOOL_OPEN").is_ok(),
@@ -950,11 +953,11 @@ impl Chat {
             .child(self.side_close(cx))
     }
 
-    /// 设置导航：顶部两个 Tab 分应用级偏好与归档会话；偏好按真值归属分组。
+    /// 设置导航树：两组（偏好 / 会话）可折叠，叶子选中切换主区；偏好按真值归属分组。
     fn settings_side_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let back = cx.entity();
-        let general = cx.entity();
-        let archive = cx.entity();
+        let prefs_open = self.settings_tree.get("prefs").copied().unwrap_or(true);
+        let sessions_open = self.settings_tree.get("sessions").copied().unwrap_or(true);
         let mut body = div()
             .id("settings-side-body")
             .flex()
@@ -984,116 +987,140 @@ impl Chat {
                     .text_color(rgb(theme::INK_SOFT))
                     .child("← 返回工作区"),
             )
+            .child(self.settings_tree_group("prefs", "偏好", cx));
+        if prefs_open {
+            body = body.child(div().pl(px(22.)).child(self.settings_tree_leaf(
+                "settings-nav:chat",
+                SettingsTab::General,
+                "聊天 · 详略",
+                "全局详略；控制 reasoning 与工具过程的默认显示",
+                cx,
+            )));
+        }
+        body = body.child(self.settings_tree_group("sessions", "会话", cx));
+        if sessions_open {
+            body = body.child(div().pl(px(22.)).child(self.settings_tree_leaf(
+                "settings-nav:archive",
+                SettingsTab::Archive,
+                "归档",
+                "可恢复，或从本机移除",
+                cx,
+            )));
+        }
+        body
+    }
+
+    /// 设置树的一个分组行：点它折叠/展开子项，不切换主区。
+    fn settings_tree_group(
+        &self,
+        key: &'static str,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let open = self.settings_tree.get(key).copied().unwrap_or(true);
+        let arrow = if open {
+            IconName::ChevronDown
+        } else {
+            IconName::ChevronRight
+        };
+        let toggle = cx.entity();
+        div()
+            .id(ElementId::Name(format!("settings-tree:{key}").into()))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .mt(px(6.))
+            .px(px(8.))
+            .py(px(6.))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::BG_HOVER)))
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                toggle.update(cx, |chat, cx| {
+                    let next = !chat.settings_tree.get(key).copied().unwrap_or(true);
+                    chat.settings_tree.insert(key.to_owned(), next);
+                    cx.notify();
+                });
+            })
+            .child(icon(arrow, 12.0, theme::INK_MUTED))
+            .child(
+                div()
+                    .text_size(px(theme::UI))
+                    .text_color(rgb(theme::INK_SOFT))
+                    .child(label),
+            )
+    }
+
+    /// 设置树的一个叶子行：选中它切换主区页面；副标题只在该叶子选中时显示。
+    fn settings_tree_leaf(
+        &self,
+        id: &'static str,
+        tab: SettingsTab,
+        label: &'static str,
+        note: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let select = cx.entity();
+        let selected = self.settings_tab == tab;
+        let mut row = div()
+            .id(ElementId::Name(id.into()))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px(px(8.))
+            .py(px(6.))
+            .rounded(px(6.))
+            .bg(rgb(if selected {
+                theme::BG_HOVER
+            } else {
+                theme::BG_SIDEBAR
+            }))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme::BG_HOVER)))
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                select.update(cx, |chat, cx| {
+                    chat.settings_tab = tab;
+                    cx.notify();
+                });
+            })
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .gap_1()
-                    .pt(px(10.))
+                    .items_center()
+                    .gap_2()
                     .child(
                         div()
-                            .id("settings-tab-general")
-                            .flex_1()
-                            .text_center()
-                            .py(px(6.))
-                            .rounded(px(6.))
-                            .bg(rgb(if self.settings_tab == SettingsTab::General {
-                                theme::BG_HOVER
-                            } else {
-                                theme::BG_SIDEBAR
-                            }))
-                            .cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                general.update(cx, |chat, cx| {
-                                    chat.settings_tab = SettingsTab::General;
-                                    cx.notify();
-                                });
-                            })
-                            .text_size(px(theme::UI))
-                            .text_color(rgb(if self.settings_tab == SettingsTab::General {
+                            .w(px(6.))
+                            .h(px(6.))
+                            .rounded_full()
+                            .bg(rgb(if selected {
                                 theme::INK
                             } else {
-                                theme::INK_SOFT
-                            }))
-                            .child("通用"),
+                                theme::INK_MUTED
+                            })),
                     )
                     .child(
                         div()
-                            .id("settings-tab-archive")
-                            .flex_1()
-                            .text_center()
-                            .py(px(6.))
-                            .rounded(px(6.))
-                            .bg(rgb(if self.settings_tab == SettingsTab::Archive {
-                                theme::BG_HOVER
-                            } else {
-                                theme::BG_SIDEBAR
-                            }))
-                            .cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                archive.update(cx, |chat, cx| {
-                                    chat.settings_tab = SettingsTab::Archive;
-                                    cx.notify();
-                                });
-                            })
                             .text_size(px(theme::UI))
-                            .text_color(rgb(if self.settings_tab == SettingsTab::Archive {
+                            .text_color(rgb(if selected {
                                 theme::INK
                             } else {
                                 theme::INK_SOFT
                             }))
-                            .child("归档"),
+                            .child(label),
                     ),
             );
-        if self.settings_tab == SettingsTab::General {
-            body = body
-                .child(
-                    div()
-                        .px(px(8.))
-                        .pt(px(10.))
-                        .pb(px(4.))
-                        .text_size(px(theme::META))
-                        .text_color(rgb(theme::INK_MUTED))
-                        .child("HOST 设置"),
-                )
-                .child(
-                    div()
-                        .id(ElementId::Name("settings-nav:chat".into()))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .px(px(8.))
-                        .py(px(6.))
-                        .rounded(px(6.))
-                        .bg(rgb(theme::BG_HOVER))
-                        .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(rgb(theme::INK)))
-                        .child(
-                            div()
-                                .text_size(px(theme::UI))
-                                .text_color(rgb(theme::INK))
-                                .child("聊天 · 详略"),
-                        ),
-                )
-                .child(
-                    div()
-                        .px(px(8.))
-                        .pt(px(8.))
-                        .text_size(px(theme::META))
-                        .text_color(rgb(theme::INK_MUTED))
-                        .child("真值在 dsh profile，经 host API 读写"),
-                );
-        } else {
-            body = body.child(
+        if selected {
+            row = row.child(
                 div()
-                    .px(px(8.))
-                    .pt(px(10.))
                     .text_size(px(theme::META))
                     .text_color(rgb(theme::INK_MUTED))
-                    .child("归档会话可恢复，或从本机移除"),
+                    .child(note),
             );
         }
-        body
+        row
     }
 
     fn side_top(&self, cx: &mut Context<Self>) -> impl IntoElement {
