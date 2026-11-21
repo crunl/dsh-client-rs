@@ -2451,8 +2451,9 @@ impl Chat {
             row = row.child(self.side_open(cx)).child(div().w(px(6.)));
         }
 
-        // 还没有会话（空状态）：标题栏不摆「未连接 / 新会话」，也不给无处的右栏开关。
-        if self.active_session.is_empty() {
+        // 设置模式 / 空状态：标题栏不摆会话面包屑，也不给无处的右栏开关。
+        // 侧栏收起时 row 里仍有展开按钮（settings tree 在侧栏里）。
+        if self.settings_open || self.active_session.is_empty() {
             return bar.child(row.child(div().flex_1()));
         }
 
