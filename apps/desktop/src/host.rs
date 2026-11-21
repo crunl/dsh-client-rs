@@ -42,6 +42,7 @@ pub struct HostProcess {
     /// 看门狗（`/bin/sh`），它负责在 app 猝死时收掉 node。
     child: Child,
     /// 真正的 host：`node bin.js --profile cowork`。
+    /// 只有见到看门狗上报的非零 pid 才会构造出来（见 [`wait_ready`]），所以一定是有效 pid。
     node_pid: u32,
 }
 
@@ -61,8 +62,14 @@ fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
-/// `kill -9`。失败就当它已经没了。
+/// `kill -9 <pid>`。失败就当它已经没了。
+///
+/// pid 0 会让 kill 把信号发给调用者所在的整个进程组（也就是 app 自己），绝不能发，
+/// 所以这里直接拒绝。
 fn kill_pid(pid: u32) {
+    if pid == 0 {
+        return;
+    }
     let _ = Command::new("kill")
         .arg("-9")
         .arg(pid.to_string())
@@ -137,6 +144,13 @@ pub fn start_isolated(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // 看门狗自成进程组：即使将来有人对它所在的组发信号，也碰不到 app 自己。
+    // 它靠 `kill -0 $PPID` 感知父进程退出，不依赖终端的组信号。
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
 
     tracing::info!(
         runtime = %launch.display_path().display(),
@@ -160,9 +174,14 @@ pub fn start_isolated(
     spawn_reader(stdout, lines_tx.clone(), eof_tx.clone());
     spawn_reader(stderr, lines_tx, eof_tx);
 
-    let ready = match wait_ready(lines_rx, eof_rx) {
+    let mut seen_pid: Option<u32> = None;
+    let ready = match wait_ready(lines_rx, eof_rx, &mut seen_pid) {
         Ok(ready) => ready,
         Err(error) => {
+            // 只要见过 node 的 pid 就先送它：看门狗若被直接 SIGKILL，它没法替 node 收尸。
+            if let Some(pid) = seen_pid {
+                kill_pid(pid);
+            }
             let _ = child.kill();
             let _ = child.wait();
             return Err(error);
@@ -199,16 +218,35 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
         .ok();
 }
 
-/// 等 ready 的结果：URL 与真正 host 的 pid（看门狗上报的）。
+/// 等 ready 的结果：URL 与真正 host 的 pid（看门狗上报的，保证非零）。
 struct Ready {
     url: String,
     node_pid: u32,
 }
 
-fn wait_ready(lines: Receiver<String>, eof: Receiver<()>) -> Result<Ready, String> {
+/// 解析看门狗的 `COWORK_HOST_PID=<pid>` 行。0 视为无效。
+fn parse_host_pid(line: &str) -> Option<u32> {
+    line.trim()
+        .strip_prefix("COWORK_HOST_PID=")?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid != 0)
+}
+
+/// 等到 URL 与 pid **都**拿到才返回。
+///
+/// 两条流由不同线程读，URL 可能先于 pid 行到达；此时只记下 URL，继续等 pid。
+/// 因此返回的 `node_pid` 一定是看门狗上报的真实非零值。
+/// `seen_pid` 记下已见到的 pid，即使之后失败，调用方也能精确收拾 node。
+fn wait_ready(
+    lines: Receiver<String>,
+    eof: Receiver<()>,
+    seen_pid: &mut Option<u32>,
+) -> Result<Ready, String> {
     let deadline = Instant::now() + READY_TIMEOUT;
     let mut tail: Vec<String> = Vec::new();
-    let mut node_pid: Option<u32> = None;
+    let mut pending_url: Option<String> = None;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -221,23 +259,13 @@ fn wait_ready(lines: Receiver<String>, eof: Receiver<()>) -> Result<Ready, Strin
         match lines.recv_timeout(left) {
             Ok(line) => {
                 let clean = strip_ansi(&line);
-                // 看门狗第一件事就把 node 的 pid 报上来，后面超时/退出才能精确收拾它。
-                if let Some(pid) = clean
-                    .trim()
-                    .strip_prefix("COWORK_HOST_PID=")
-                    .and_then(|text| text.trim().parse::<u32>().ok())
-                {
-                    node_pid = Some(pid);
-                    continue;
-                }
-                // 日志行可能带前缀，URL 出现在中间；只认带 token 的那条。
-                if let Some(url) = extract_ready_url(&clean) {
-                    return Ok(Ready {
-                        url,
-                        node_pid: node_pid.unwrap_or(0),
-                    });
-                }
-                if !clean.trim().is_empty() {
+                if let Some(pid) = parse_host_pid(&clean) {
+                    // 看门狗第一件事就把 node 的 pid 报上来，后面超时/退出才能精确收拾它。
+                    *seen_pid = Some(pid);
+                } else if let Some(url) = extract_ready_url(&clean) {
+                    // 日志行可能带前缀，URL 出现在中间；只认带 token 的那条。
+                    pending_url = Some(url);
+                } else if !clean.trim().is_empty() {
                     // host 输出可能带含 token 的 ready 行；进日志/尾巴前统一脱敏。
                     let safe = redact_token(&clean);
                     tracing::debug!(line = %safe, "host");
@@ -245,6 +273,11 @@ fn wait_ready(lines: Receiver<String>, eof: Receiver<()>) -> Result<Ready, Strin
                     if tail.len() > 40 {
                         tail.remove(0);
                     }
+                }
+                if let Some(node_pid) = *seen_pid
+                    && let Some(url) = pending_url.take()
+                {
+                    return Ok(Ready { url, node_pid });
                 }
             }
             Err(RecvTimeoutError::Timeout) => continue,
@@ -327,7 +360,8 @@ fn dsh_home() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::redact_token;
+    use super::{redact_token, wait_ready};
+    use std::sync::mpsc::channel;
 
     #[test]
     fn redact_token_hides_the_value_but_keeps_the_shape() {
@@ -341,5 +375,31 @@ mod tests {
             "url=http://x/?token=***&y=2 tail"
         );
         assert_eq!(redact_token("no credentials here"), "no credentials here");
+    }
+
+    /// URL 行先于 pid 行到达时，结果的 pid 必须是真实值，而不是 0。
+    #[test]
+    fn wait_ready_waits_for_pid_when_url_arrives_first() {
+        let (lines_tx, lines_rx) = channel::<String>();
+        let (_eof_tx, eof_rx) = channel::<()>();
+        lines_tx
+            .send("web: http://127.0.0.1:50837/?token=abc".to_owned())
+            .expect("send url");
+        lines_tx
+            .send("COWORK_HOST_PID=4242".to_owned())
+            .expect("send pid");
+
+        let mut seen_pid = None;
+        let ready = wait_ready(lines_rx, eof_rx, &mut seen_pid).expect("ready");
+        assert_eq!(ready.node_pid, 4242);
+        assert_eq!(seen_pid, Some(4242));
+        assert_eq!(ready.url, "http://127.0.0.1:50837/?token=abc");
+    }
+
+    /// pid 为 0 不是有效 pid，不能被当作 node 记下来。
+    #[test]
+    fn parse_host_pid_rejects_zero() {
+        assert_eq!(super::parse_host_pid("COWORK_HOST_PID=0"), None);
+        assert_eq!(super::parse_host_pid("COWORK_HOST_PID=17"), Some(17));
     }
 }

@@ -8,7 +8,7 @@
 //! 这里把 socket 收归一个后台任务：上行发 `open` / `cancel`，下行按 `streamId`
 //! 把帧分给各自的 channel。副作用是更省内存——整窗口只有一条 WS。
 
-use crate::connection::{Connection, HostError};
+use crate::connection::{Connection, HostError, WS_HANDSHAKE_TIMEOUT};
 use dsh_protocol::Payload;
 use dsh_protocol::stream::{StreamItem, StreamItemKind};
 use futures_util::{SinkExt, StreamExt};
@@ -64,8 +64,13 @@ enum Command {
 
 impl Mux {
     /// 打开（或复用）这条连接上的唯一 socket。
+    ///
+    /// 连接的槽位锁贯穿「检查 → 握手 → 存入」：并发调用者排队，后到者直接拿到先到者
+    /// 建好的 mux，不会再开第二条 socket（那会被 gateway 以 409 拒绝）。
+    /// 槽位里若是已死的 mux（socket 已断），则替换为新建的。
     pub async fn of(conn: &Connection) -> Result<Arc<Self>, HostError> {
-        if let Some(mux) = conn.mux().get() {
+        let mut slot = conn.mux().lock().await;
+        if let Some(mux) = slot.as_ref().filter(|mux| !mux.is_closed()) {
             return Ok(Arc::clone(mux));
         }
         let socket = match handshake(conn).await {
@@ -75,12 +80,14 @@ impl Mux {
             }
             other => other?,
         };
-        // 竞态下可能已经被别人塞进去了；用先到的那个，后建的任务自己退出。
-        let built = conn
-            .mux()
-            .get_or_init(|| async { Arc::new(Self::start(socket)) })
-            .await;
-        Ok(Arc::clone(built))
+        let mux = Arc::new(Self::start(socket));
+        *slot = Some(Arc::clone(&mux));
+        Ok(mux)
+    }
+
+    /// 后台任务已退出（socket 断开），此 mux 不能再用。
+    fn is_closed(&self) -> bool {
+        self.commands.is_closed()
     }
 
     fn start(socket: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
@@ -173,7 +180,12 @@ async fn handshake(
     let cookie = HeaderValue::from_str(&conn.cookie()).map_err(|_| HostError::InvalidCookie)?;
     request.headers_mut().insert(COOKIE, cookie);
 
-    match connect_async(request).await {
+    // 超时：host 接了 TCP 但不完成升级时，不能让调用方永远等。
+    let connected = tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, connect_async(request))
+        .await
+        .map_err(|_| HostError::Timeout)?;
+
+    match connected {
         Ok((socket, _response)) => Ok(socket),
         Err(tokio_tungstenite::tungstenite::Error::Http(response)) if response.status() == 401 => {
             Err(HostError::Unauthorized)
