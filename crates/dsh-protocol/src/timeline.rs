@@ -166,6 +166,9 @@ pub struct ToolView {
     pub title: String,
     /// 协议层给出的摘要。
     pub summary: String,
+    /// 失败 / 中断时取结果正文首行，顶替标题显示在折叠行上。
+    /// 官方 `ToolRow` 的 `failureLine`：今天用户不必点开每一行才知道为什么失败。
+    pub error_summary: Option<String>,
     /// 展开后的审计字段，最多 4 行。
     pub details: Vec<ToolDetail>,
     /// 状态。
@@ -552,7 +555,17 @@ pub fn tool_view(call: &ToolCall) -> ToolView {
     .map(|detail| detail.value.clone())
     .unwrap_or_else(|| call.summary.clone());
 
-    let result = if call.status == ToolStatus::Error {
+    let error_summary = if matches!(call.status, ToolStatus::Error | ToolStatus::Stopped) {
+        call.detail
+            .lines()
+            .next()
+            .map(|line| bounded(line.trim(), 160))
+            .filter(|line| !line.is_empty())
+    } else {
+        None
+    };
+
+    let result = if matches!(call.status, ToolStatus::Error | ToolStatus::Stopped) {
         ToolResultView::Error {
             text: bounded(&call.detail, 4096),
         }
@@ -578,6 +591,7 @@ pub fn tool_view(call: &ToolCall) -> ToolView {
         family: tool_family,
         title,
         summary: redact_text(&call.summary),
+        error_summary,
         details,
         status: call.status,
         output_chars: call.detail_chars,
@@ -705,6 +719,22 @@ mod tests {
             detail: String::new(),
             detail_chars: 0,
         }
+    }
+
+    #[test]
+    fn failed_tool_view_surfaces_error_summary() {
+        let mut current = call("bash", r#"{"command":"ls /root"}"#);
+        current.status = ToolStatus::Error;
+        current.detail = "exit 1: permission denied\n第二行噪声".to_owned();
+        let view = tool_view(&current);
+        assert_eq!(
+            view.error_summary.as_deref(),
+            Some("exit 1: permission denied")
+        );
+        assert!(matches!(view.result, ToolResultView::Error { .. }));
+
+        let ok = tool_view(&call("bash", r#"{"command":"ls"}"#));
+        assert_eq!(ok.error_summary, None);
     }
 
     #[test]

@@ -3316,8 +3316,10 @@ impl Chat {
         let stroke = match view.status {
             ToolStatus::Running => theme::INK_SOFT,
             ToolStatus::Ok => theme::INK_MUTED,
-            ToolStatus::Error => theme::INK,
+            ToolStatus::Error | ToolStatus::Stopped => theme::INK,
         };
+        // 失败 / 中断时用结果首行顶替参数派生的标题，折叠行就能看到原因。
+        let title = view.error_summary.as_deref().unwrap_or(&view.title);
 
         let row = div()
             .flex()
@@ -3347,14 +3349,14 @@ impl Chat {
                     .overflow_hidden()
                     .text_size(px(theme::META))
                     .text_color(rgb(stroke))
-                    .child(view.title.clone()),
+                    .child(title.to_owned()),
             )
             .child(
                 div()
                     .flex_shrink_0()
                     .text_size(px(theme::META))
                     .text_color(rgb(match view.status {
-                        ToolStatus::Error => theme::INK,
+                        ToolStatus::Error | ToolStatus::Stopped => theme::INK,
                         _ => theme::INK_MUTED,
                     }))
                     .child(tool_suffix(view)),
@@ -4245,10 +4247,10 @@ fn render_row(row: &TimelineRow) -> AnyElement {
 
 /// reasoning 折叠态的一行摘要。
 ///
-/// 流式取最后一行非空文本（首行往往是开场白，信息量最低），已落定取首行；
-/// Quiet 档（简洁）两种都不给摘要。正文始终是纯文本，不解析 markdown。
+/// 流式时摘要强制显示（与档位无关，官方 `running || settledReasoningPreview`），
+/// 落定时才按档位给不给预览：简洁档不显示已结算预览。
 fn reasoning_summary(text: &str, streaming: bool, detail: Detail) -> String {
-    if detail == Detail::Quiet {
+    if detail == Detail::Quiet && !streaming {
         return String::new();
     }
     let line = if streaming {
@@ -4268,7 +4270,7 @@ fn tool_body(view: &ToolView) -> String {
         .collect();
     // 成功的文件读/写输出是噪声（ZCode 同样不渲染），错误与 shell/搜索类仍保留。
     let show_text_output = match view.status {
-        ToolStatus::Error => true,
+        ToolStatus::Error | ToolStatus::Stopped => true,
         ToolStatus::Ok => !matches!(view.family, ToolFamily::FileRead | ToolFamily::FileWrite),
         ToolStatus::Running => false,
     };
@@ -4294,7 +4296,14 @@ fn tool_body(view: &ToolView) -> String {
             lines.push(format!("+{added} -{removed}"));
             lines.push(preview.clone());
         }
-        ToolResultView::Error { text } => lines.push(format!("失败: {text}")),
+        ToolResultView::Error { text } => {
+            let label = if view.status == ToolStatus::Stopped {
+                "已停止"
+            } else {
+                "失败"
+            };
+            lines.push(format!("{label}: {text}"));
+        }
         ToolResultView::Preview { title, text } => {
             lines.push(title.clone());
             lines.push(text.clone());
@@ -4316,13 +4325,18 @@ fn tool_icon(family: ToolFamily) -> IconName {
 }
 
 /// 行尾后缀：状态 + 输出长度 + 可选耗时。
+/// 失败 / 中断行丢弃长度与耗时——那是噪声，官方同样只留状态提示。
 fn tool_suffix(view: &ToolView) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    match view.status {
-        ToolStatus::Running => parts.push("运行中".to_owned()),
-        ToolStatus::Error => parts.push("失败".to_owned()),
-        ToolStatus::Ok => {}
+    let status = match view.status {
+        ToolStatus::Running => "运行中",
+        ToolStatus::Error => "失败",
+        ToolStatus::Stopped => "已停止",
+        ToolStatus::Ok => "",
+    };
+    if !status.is_empty() {
+        return status.to_owned();
     }
+    let mut parts: Vec<String> = Vec::new();
     if view.output_chars > 0 {
         parts.push(format!("{} 字", view.output_chars));
     }
@@ -4635,7 +4649,7 @@ fn short_id(session: &str) -> &str {
 mod tests {
     use super::{
         ModelGroup, PullRow, SelectedModel, format_tokens, group_plan, host_status, leaf,
-        model_menu_rows, reasoning_summary, short_id, tool_body,
+        model_menu_rows, reasoning_summary, short_id, tool_body, tool_suffix,
     };
     use crate::{HostLifecycle, ModelOption, SessionInfo, SidebarPrefs};
     use dsh_protocol::presentation::{Detail, group_summary, plan, process_runs};
@@ -4747,6 +4761,7 @@ mod tests {
             family: ToolFamily::Shell,
             title: "ls".to_owned(),
             summary: "ls".to_owned(),
+            error_summary: None,
             details: Vec::new(),
             status: dsh_protocol::transcript::ToolStatus::Ok,
             output_chars: 0,
@@ -4848,12 +4863,16 @@ mod tests {
             reasoning_summary("第一行", true, Detail::Standard),
             "第一行"
         );
-        assert_eq!(reasoning_summary("第一行\n第二行", true, Detail::Quiet), "");
+        // 简洁档只关「已结算预览」；流式时摘要强制显示，与档位无关。
+        assert_eq!(
+            reasoning_summary("第一行\n第二行", true, Detail::Quiet),
+            "第二行"
+        );
     }
 
     #[test]
     fn verbosity_controls_default_open_per_layer() {
-        // 每个档位展开一层：简洁折整轮，标准折过程组，详细展开过程组。
+        // 三档都折叠已完成轮；展开后的组层才按档位变化。
         let rows = vec![user_row(), tool("t1"), text("答")];
         let open = |detail| {
             let ops = plan(
@@ -4867,9 +4886,10 @@ mod tests {
             };
             spec.open
         };
+        // 三档都折叠已完成轮（官方 foldCompletedTurns）；展开深度只决定组层。
         assert!(!open(Detail::Quiet));
-        assert!(open(Detail::Brief));
-        assert!(open(Detail::Standard));
+        assert!(!open(Detail::Brief));
+        assert!(!open(Detail::Standard));
     }
 
     /// 组头把 N 条工具压成一行分类统计，运行中高亮最后一条的摘要。
@@ -4893,6 +4913,24 @@ mod tests {
 
         let settled = group_summary(&rows, false, true);
         assert!(settled.contains("编辑 1"), "分类统计带数量：{settled}");
+    }
+
+    #[test]
+    fn tool_suffix_drops_noise_on_failure() {
+        let mut row = tool("x");
+        let TimelineRow::Tool(view) = &mut row else {
+            unreachable!()
+        };
+        view.output_chars = 12345;
+        view.elapsed_ms = Some(320);
+        view.status = dsh_protocol::transcript::ToolStatus::Error;
+        assert_eq!(tool_suffix(view), "失败");
+        view.status = dsh_protocol::transcript::ToolStatus::Stopped;
+        assert_eq!(tool_suffix(view), "已停止");
+        view.status = dsh_protocol::transcript::ToolStatus::Ok;
+        let suffix = tool_suffix(view);
+        assert!(suffix.contains("12345 字"), "{suffix}");
+        assert!(suffix.contains("320ms"), "{suffix}");
     }
 
     /// 成功的文件读输出不铺进展开区；shell 成功与失败仍保留输出。

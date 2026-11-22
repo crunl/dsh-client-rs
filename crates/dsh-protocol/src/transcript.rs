@@ -19,6 +19,8 @@ pub enum ToolStatus {
     Ok,
     /// 报错结束。
     Error,
+    /// 被用户 / 主机中断（官方 `stopped`）。与 `Error` 区分，避免「按了停止却显示失败」。
+    Stopped,
 }
 
 /// 一次工具调用（已配对）。
@@ -236,10 +238,19 @@ impl Transcript {
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
                     || data.get("error").is_some_and(|error| !error.is_null());
+                // 官方把 interrupted 单列为 `stopped`，不混进 error。错误字段可能是
+                // 字符串 `"interrupted"`，也可能是 `{ code: "interrupted", ... }`。
+                let interrupted = data.get("error").is_some_and(|error| {
+                    error.as_str() == Some("interrupted")
+                        || error.get("code").and_then(Value::as_str) == Some("interrupted")
+                        || error.get("message").and_then(Value::as_str) == Some("interrupted")
+                });
                 let raw = text_of(data.pointer("/message/content"));
                 let detail_chars = raw.chars().count();
                 let detail = truncate(raw);
-                let status = if failed {
+                let status = if interrupted {
+                    ToolStatus::Stopped
+                } else if failed {
                     ToolStatus::Error
                 } else {
                     ToolStatus::Ok
@@ -774,6 +785,30 @@ mod tests {
         };
         assert_eq!(call.status, ToolStatus::Error);
         assert_eq!(call.detail, "boom");
+    }
+
+    #[test]
+    fn interrupted_result_is_stopped_not_error() {
+        for error in [
+            json!("interrupted"),
+            json!({ "code": "interrupted", "message": "user stopped" }),
+            json!({ "message": "interrupted" }),
+        ] {
+            let mut transcript = Transcript::new();
+            transcript.push_event(&call("c7", "bash", r#"{"command":"sleep 10"}"#));
+            transcript.push_event(&json!({
+                "type": "tool/result",
+                "data": {
+                    "callId": "c7",
+                    "message": { "content": [{ "type": "text", "text": "已停止" }] },
+                    "error": error,
+                }
+            }));
+            let Some(Entry::Tool(call)) = transcript.entries().first() else {
+                panic!("应有工具行");
+            };
+            assert_eq!(call.status, ToolStatus::Stopped, "error={error}");
+        }
     }
 
     #[test]

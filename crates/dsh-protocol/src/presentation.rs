@@ -7,8 +7,9 @@
 //! 1. 轮次边界来自用户输入行（官方 `exchange` 的定义），既不依赖 turn 事件，
 //!    也不依赖数组下标——本地乐观消息和 `Seq` 身份同样成立；
 //! 2. 折叠身份是语义键，与渲染位置无关，分页 / 流式追加都不改变它；
-//! 3. 详略是一个「展开深度」标量——相邻档只差展开一层容器，这是唯一
-//!    「不点就能看见」的差异。
+//! 3. 档位是两个决策的组合，不是一个序数：「已完成轮是否收起」（官方
+//!    `foldCompletedTurns`）与「展开到第几层容器」。前者按档位显式给，后者
+//!    才用深度标量——这样紧凑/标准/详细都能折叠历史轮，而完全展开不折。
 //!
 //! 本模块无 GPUI、无 IO、无订阅。输入只有行切片与偏好，输出只有绘制指令；
 //! 因此可以用表驱动测试穷举 `(档位 × 运行态 × 覆盖)`。
@@ -19,21 +20,22 @@ use std::ops::Range;
 use crate::timeline::{RenderId, TimelineRow};
 use crate::transcript::ToolStatus;
 
-/// 详略 = 默认展开到第几层容器。
+/// 详略档位。两个正交决策的合成：
+/// - `fold_completed`：已完成轮次是否默认整轮收起（官方 `foldCompletedTurns`）；
+/// - `depth`：展开到第几层容器（Turn → Group → 单节点）。
 ///
-/// 容器由外到内三层：`Turn`（整轮）→ `Group`（过程组）→ 单节点正文。
-/// 每升一档只多展开一层，档位之间因此产生「一类内容出现或消失」的质变，
-/// 而不是在同一骨架上微调文字。
+/// 官方 compact / standard / detailed 三档都折叠已完成轮次，只有 verbose 不折；
+/// 把这条从深度里拎出来，才能让相邻档的差异仍落在「一层内容出现或消失」上。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Detail {
-    /// 深度 0：整轮折叠，只剩轮次控件与豁免的正文回复。
+    /// 折叠整轮；展开后只到组头，组头给类别摘要，推理不给预览。
     Quiet,
-    /// 深度 1：整轮展开、过程组折叠，只看得到组头。
+    /// 折叠整轮；展开后只到组头，但组头带实时详情、推理给首行预览。
     #[default]
     Brief,
-    /// 深度 2：过程组也展开，看得到每条 reasoning / 工具行。
+    /// 折叠整轮；展开后过程组也展开，看得到每条推理与工具行。
     Standard,
-    /// 深度 3：全部平铺，连单节点正文也默认展开。
+    /// 不折叠整轮、完全平铺，连单节点正文也默认展开。
     Full,
 }
 
@@ -41,7 +43,8 @@ impl Detail {
     /// settings 页按这个顺序画。
     pub const ALL: [Self; 4] = [Self::Quiet, Self::Brief, Self::Standard, Self::Full];
 
-    /// 默认展开到第几层：`0`=整轮、`1`=过程组、`2`=单节点、`3`=全部。
+    /// 默认展开到第几层容器：`0`=整轮、`1`=过程组、`2`=单节点、`3`=全部。
+    /// 注意整轮的默认开合不走这里，而走 [`Self::fold_completed`]。
     const fn depth(self) -> u8 {
         match self {
             Self::Quiet => 0,
@@ -49,6 +52,12 @@ impl Detail {
             Self::Standard => 2,
             Self::Full => 3,
         }
+    }
+
+    /// 已完成轮次默认是否整轮收起（官方 `foldCompletedTurns`）。
+    /// compact / standard / detailed 为真，verbose 为假——与深度无关。
+    const fn fold_completed(self) -> bool {
+        !self.is_flat()
     }
 
     /// Full 档不生成任何包裹控件，完全平铺。
@@ -214,8 +223,8 @@ fn plan_exchange<'a>(
 
     let anchor = row_label(&window[0]);
     let turn_key = FoldKey::Turn(anchor.clone());
-    // active 为假（历史轮 / 会话空闲）时一律不认 running，残留 Running 行可照常折叠。
-    let turn_running = active && window.iter().any(is_running_row);
+    // active 为假（历史轮 / 会话空闲）时不认 running，但失败 / 中断仍要恒展开。
+    let turn_pin = pin_of(window, active);
 
     let mut inner = Vec::new();
     let mut cursor = 0usize;
@@ -225,7 +234,8 @@ fn plan_exchange<'a>(
             inner.push(RenderOp::Row(row));
         }
         let slice = &window[range.clone()];
-        let running = active && slice.iter().any(is_running_row);
+        let pin = pin_of(slice, active);
+        let running = pin == Pin::Running;
         let key = FoldKey::Group {
             turn: anchor.clone(),
             ordinal: ordinal as u16,
@@ -234,8 +244,8 @@ fn plan_exchange<'a>(
         let spec = FoldSpec {
             key: key.clone(),
             level: FoldLevel::Group,
-            collapsible: !running,
-            open: running || over.is_open(&key, default_open),
+            collapsible: !pin.is_pinned(),
+            open: pin.is_pinned() || over.is_open(&key, default_open),
             summary: group_summary(slice, running, detail.live_detail()),
         };
         inner.push(RenderOp::Group { spec, rows: slice });
@@ -245,13 +255,14 @@ fn plan_exchange<'a>(
         inner.push(RenderOp::Row(row));
     }
 
-    let default_open = detail.layer_open(0);
+    // 已完成轮的默认开合由 fold_completed 决定；运行中 / 失败 / 中断优先恒展开。
+    let default_open = !detail.fold_completed();
     let turn_spec = FoldSpec {
         key: turn_key.clone(),
         level: FoldLevel::Turn,
-        collapsible: !turn_running,
-        open: turn_running || over.is_open(&turn_key, default_open),
-        summary: turn_summary(window, turn_running),
+        collapsible: !turn_pin.is_pinned(),
+        open: turn_pin.is_pinned() || over.is_open(&turn_key, default_open),
+        summary: turn_summary(window, turn_pin),
     };
     out.push(RenderOp::Turn {
         spec: turn_spec,
@@ -287,6 +298,48 @@ fn is_running_row(row: &TimelineRow) -> bool {
         TimelineRow::Tool(view) => view.status == ToolStatus::Running,
         _ => false,
     }
+}
+
+/// 容器为何必须保持展开、不给收起入口。
+///
+/// - `Running`：只在会话忙的活跃轮认，历史残留的 Running 不算（见 `plan` 的 active）；
+/// - `Failed` / `Interrupted`：工具报错或被用户中断，**历史轮也恒展开**——
+///   否则用户看不到失败原因，与官方 `error/aborted/interrupted` 恒展开相反。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pin {
+    None,
+    Running,
+    Failed,
+    Interrupted,
+}
+
+impl Pin {
+    fn is_pinned(self) -> bool {
+        self != Self::None
+    }
+}
+
+/// 一段行是否富含「不可收起」的理由；运行中需要 `active` 门，失败与中断不需要。
+fn pin_of(rows: &[TimelineRow], active: bool) -> Pin {
+    if active && rows.iter().any(is_running_row) {
+        return Pin::Running;
+    }
+    if rows
+        .iter()
+        .any(|row| matches!(row, TimelineRow::Notice { .. }))
+    {
+        return Pin::Interrupted;
+    }
+    if rows.iter().any(|row| {
+        matches!(
+            row,
+            TimelineRow::Tool(view)
+                if matches!(view.status, ToolStatus::Error | ToolStatus::Stopped)
+        )
+    }) {
+        return Pin::Failed;
+    }
+    Pin::None
 }
 
 fn row_label(row: &TimelineRow) -> String {
@@ -331,17 +384,21 @@ pub fn group_summary(rows: &[TimelineRow], running: bool, live_detail: bool) -> 
         .join(" · ")
 }
 
-/// 整轮控件文案：工具计数 + 运行中 / 已完成。
-fn turn_summary(window: &[TimelineRow], running: bool) -> String {
+/// 整轮控件文案：状态 + 工具计数。状态区分工作中 / 已中断 / 执行失败 / 已完成。
+fn turn_summary(window: &[TimelineRow], pin: Pin) -> String {
     let tool_count = window
         .iter()
         .filter(|row| matches!(row, TimelineRow::Tool(_)))
         .count();
-    match (running, tool_count) {
-        (true, 0) => "工作中".to_owned(),
-        (true, n) => format!("工作中 · {n} 次工具"),
-        (false, 0) => "已完成".to_owned(),
-        (false, n) => format!("已完成 · {n} 次工具"),
+    let label = match pin {
+        Pin::Running => "工作中",
+        Pin::Interrupted => "已中断",
+        Pin::Failed => "执行失败",
+        Pin::None => "已完成",
+    };
+    match tool_count {
+        0 => label.to_owned(),
+        n => format!("{label} · {n} 次工具"),
     }
 }
 
@@ -384,6 +441,7 @@ mod tests {
             family: ToolFamily::Shell,
             title: format!("跑命令 {turn}"),
             summary: String::new(),
+            error_summary: None,
             details: Vec::new(),
             status: if running {
                 ToolStatus::Running
@@ -394,6 +452,22 @@ mod tests {
             elapsed_ms: None,
             result: ToolResultView::None,
         })
+    }
+    fn failed_tool(turn: u64) -> TimelineRow {
+        let mut row = tool(turn, false);
+        let TimelineRow::Tool(view) = &mut row else {
+            unreachable!()
+        };
+        view.status = ToolStatus::Error;
+        view.title = "命令失败".to_owned();
+        view.error_summary = Some("exit 1: permission denied".to_owned());
+        row
+    }
+    fn interrupted(turn: u64) -> TimelineRow {
+        TimelineRow::Notice {
+            id: RenderId::Notice(turn),
+            text: "生成被中断".to_owned(),
+        }
     }
     fn count_ops<'a>(
         ops: &[RenderOp<'a>],
@@ -453,10 +527,11 @@ mod tests {
     #[test]
     fn detail_depth_controls_default_open_per_layer() {
         let rows = vec![user(1), reasoning(1, false), tool(1, false), assistant(1)];
+        // 三档都折叠已完成轮；展开后 Brief 只到组头，Standard 连组也展开。
         for (detail, turn_open, group_open) in [
             (Detail::Quiet, false, false),
-            (Detail::Brief, true, false),
-            (Detail::Standard, true, true),
+            (Detail::Brief, false, false),
+            (Detail::Standard, false, true),
         ] {
             let ops = plan(&rows, detail, &Overrides::default(), false);
             let RenderOp::Turn { spec: turn, inner } = &ops[0] else {
@@ -471,6 +546,35 @@ mod tests {
                 unreachable!()
             };
             assert_eq!(group.open, group_open, "group open @ {detail:?}");
+        }
+    }
+
+    #[test]
+    fn fold_completed_follows_official_capability_bit() {
+        // 官方 compact/standard/detailed 折叠已完成轮，只有 verbose 不折。
+        // 这是与「展开深度」正交的能力位，不能从深度推导。
+        assert!(Detail::Quiet.fold_completed());
+        assert!(Detail::Brief.fold_completed());
+        assert!(Detail::Standard.fold_completed());
+        assert!(!Detail::Full.fold_completed());
+    }
+
+    #[test]
+    fn failed_or_interrupted_turn_is_pinned_even_in_history() {
+        // 回归：失败 / 中断的轮次必须恒展开，否则用户看不到原因。
+        // 会话空闲（历史轮）也成立——这与「残留 Running 不锁死折叠」相反。
+        for rows in [
+            vec![user(1), failed_tool(1), assistant(1)],
+            vec![user(1), tool(1, false), interrupted(1), assistant(1)],
+        ] {
+            for detail in [Detail::Quiet, Detail::Brief, Detail::Standard] {
+                let ops = plan(&rows, detail, &Overrides::default(), false);
+                let RenderOp::Turn { spec, .. } = &ops[0] else {
+                    panic!("应是整轮");
+                };
+                assert!(!spec.collapsible, "失败轮不该可收起 @ {detail:?}");
+                assert!(spec.open, "失败轮必须展开 @ {detail:?}");
+            }
         }
     }
 

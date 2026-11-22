@@ -65,10 +65,10 @@ impl ChatVerbosity {
     /// UI 说明：说清楚它实际改变什么，不写空泛的 marketing copy。
     pub const fn description(self) -> &'static str {
         match self {
-            Self::Low => "整轮过程收成一行摘要，只显示你的输入与助手回复",
-            Self::Medium => "展开整轮，但过程组保持折叠，只看得到组头摘要",
-            Self::High => "过程组也展开，显示每条推理与工具；正文点开再读",
-            Self::Full => "全部平铺：过程无组头，推理与工具正文默认展开",
+            Self::Low => "已完成轮次收成一行，只显示你的输入与助手回复",
+            Self::Medium => "已完成轮次收成一行；展开后只到过程组头，带实时详情",
+            Self::High => "已完成轮次收成一行；展开后过程组也展开，看到每条推理与工具",
+            Self::Full => "全部平铺、不折叠：推理与工具正文默认展开",
         }
     }
 
