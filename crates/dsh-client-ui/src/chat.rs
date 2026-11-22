@@ -14,13 +14,14 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::completion;
 use crate::markdown::TextRole;
-use crate::settings::{ChatVerbosity, RenderPolicy, Settings};
+use crate::settings::{ChatVerbosity, Settings};
 use crate::theme;
 use crate::{
     CompletionItem, CtxMeter, DiscoveredChoice, EffortOption, HostLifecycle, ModelGroup,
     PresetInfo, ProviderSetting, SelectedModel, SessionInfo, SidebarPrefs, UiCommand, UiEvent,
 };
 use dsh_protocol::context::Occupancy;
+use dsh_protocol::presentation::{Detail, FoldSpec, Overrides, RenderOp, plan};
 use dsh_protocol::transcript::ToolStatus;
 use dsh_protocol::{ChatTimeline, RenderId, TimelineRow, ToolFamily, ToolResultView, ToolView};
 use gpui_kit::assets::IconName;
@@ -95,14 +96,9 @@ pub struct Chat {
     model_discover_seq: u64,
     model_discover_choices: Vec<DiscoveredChoice>,
     model_discover_error: Option<String>,
-    /// 每个工具行正文的开合覆盖；单个工具正文始终是手动展开。
-    tool_open: HashMap<String, bool>,
-    /// 每个 reasoning 块的正文开合覆盖；会话内状态，不写设置。
-    reasoning_open: HashMap<String, bool>,
-    /// 仅调试：把过程与正文都当成展开（验排版用）。
-    debug_tools_open: bool,
-    /// 过程组的开合；没有记录的组按档位默认。
-    open_groups: HashMap<String, bool>,
+    /// 所有折叠容器的会话内交互状态：语义键 -> 手动开合。取代原先三个
+    /// `HashMap<String, bool>`；键与渲染位置无关，分页 / 流式追加不漂移。
+    overrides: Overrides,
     /// 左侧栏是否展开（侧栏顶部的关闭按钮收起，标题栏左侧的按钮展开）。
     sidebar_open: bool,
     /// 右侧面板是否展开（标题栏面板图标切换）。
@@ -503,10 +499,10 @@ impl Chat {
             model_discover_seq: 0,
             model_discover_choices: Vec::new(),
             model_discover_error: None,
-            tool_open: HashMap::new(),
-            reasoning_open: HashMap::new(),
-            debug_tools_open: std::env::var("DSH_DEBUG_TOOL_OPEN").is_ok(),
-            open_groups: HashMap::new(),
+            overrides: Overrides {
+                force_open: std::env::var("DSH_DEBUG_TOOL_OPEN").is_ok(),
+                ..Overrides::default()
+            },
             sidebar_open: true,
             right_panel_open: false,
             completion: None,
@@ -642,6 +638,9 @@ impl Chat {
                 self.occupancy = None;
                 self.cache_hit = None;
                 self.meter = None;
+                // 会话身份变化（新建 / 重连）：折叠覆盖的键只在单个会话内唯一，
+                // 必须清掉，否则上一会话的展开/折叠会命中新会话的同构轮次。
+                self.overrides.folds.clear();
             }
             UiEvent::Sessions(items) => {
                 self.sessions = items;
@@ -745,9 +744,9 @@ impl Chat {
                     return;
                 }
                 self.timeline.replace_snapshot(items);
-                self.tool_open.clear();
-                self.reasoning_open.clear();
-                self.open_groups.clear();
+                // 语义键在 id 已权威时稳定；乐观 id（msg:local:N）刚被权威 id 替换的
+                // 那一轮，其覆盖会自然失效——无害，且不会误折叠别一轮。
+                // 跨会话泄漏由切会话处的 overrides.folds.clear() 兜底。
             }
             UiEvent::Tool(call) => {
                 // 时间线模块按 `callId` upsert：发起插行，结果回来原地收尾。
@@ -1099,7 +1098,7 @@ impl Chat {
                 "settings-nav:chat",
                 SettingsTab::General,
                 "聊天 · 详略",
-                "全局详略；控制 reasoning 与工具过程的默认显示",
+                "全局详略：整轮 → 过程组 → 正文，逐档多展开一层",
                 cx,
             )));
             body = body.child(div().pl(px(22.)).child(self.settings_tree_leaf(
@@ -1917,6 +1916,9 @@ impl Chat {
                         chat.active_session = id.clone();
                         chat.finish_turn();
                         chat.timeline = ChatTimeline::new();
+                        // 折叠覆盖的键（turn/step/callId）只在单个会话内唯一：切会话
+                        // 必须清掉，否则 A 会话展开/折叠的轮会泄漏到 B 会话的同构轮次。
+                        chat.overrides.folds.clear();
                         cx.notify();
                     }
                 });
@@ -2105,7 +2107,7 @@ impl Chat {
                                 div()
                                     .text_size(px(theme::META))
                                     .text_color(rgb(theme::INK_MUTED))
-                                    .child("全局详略；控制 reasoning 与工具过程的默认显示"),
+                                    .child("全局详略：每升一档多展开一层容器（整轮 → 过程组 → 正文）"),
                             ),
                     )
                     .child(
@@ -2801,13 +2803,10 @@ impl Chat {
         )
     }
 
-    /// 应用档位只影响默认值；已展开的会话内覆盖清掉，让新档位立即生效。
+    /// 应用档位只影响默认值；语义键上的手动覆盖保留，让新档位与用户选择共存。
     /// 真值由 host 回送，这里只更新内存镜像。
     fn apply_verbosity(&mut self, verbosity: ChatVerbosity) {
         self.settings.verbosity = verbosity;
-        self.tool_open.clear();
-        self.reasoning_open.clear();
-        self.open_groups.clear();
     }
 
     // ── 主区 ────────────────────────────────────────────────────────────
@@ -3111,21 +3110,13 @@ impl Chat {
             .max_w(px(theme::CONTENT_W))
             .gap_3();
 
-        // 行来自时间线投影；过程组是渲染期派生的，不回写投影状态。
-        // 详略档位只改显示默认值，不改投影：切档不会丢会话内容。
+        // 行来自时间线投影；绘制结构由纯函数 `plan` 决定：档位只是一个展开
+        // 深度标量，手动覆盖按语义键优先。切档 / 分页都不重建会话内容。
         let rows = self.timeline.rows();
-        let mut index = 0;
-        for run in process_runs(&rows) {
-            while index < run.start {
-                column = column.child(render_row(&rows[index]));
-                index += 1;
-            }
-            column = column.child(self.process_group(&rows[run.clone()], cx));
-            index = run.end;
-        }
-        while index < rows.len() {
-            column = column.child(render_row(&rows[index]));
-            index += 1;
+        let detail = self.settings.verbosity.detail();
+        let ops = plan(&rows, detail, &self.overrides, self.phase.is_busy());
+        for op in &ops {
+            column = column.child(self.render_op(op, cx));
         }
 
         if let Some(status) = self.running_status() {
@@ -3143,81 +3134,105 @@ impl Chat {
         )
     }
 
-    /// 一段连续的过程行（reasoning + 工具）：组头 + 可选的行列表。
-    fn process_group(&self, rows: &[TimelineRow], cx: &mut Context<Self>) -> Div {
-        let Some(first) = rows.first() else {
-            return div();
-        };
-        let key = row_render_id(first).label();
-        let policy = self.settings.verbosity.policy();
-        let running_turn = process_group_running(rows, self.phase.is_busy());
-        let open = self.debug_tools_open
-            || self
-                .open_groups
-                .get(&key)
-                .copied()
-                .unwrap_or_else(|| policy.group_body_open(running_turn));
-
-        let mut group = div().flex().flex_col().gap_1();
-        {
-            let toggle = cx.entity();
-            let toggle_key = key.clone();
-            let header = div()
-                .id(format!("group-header:{key}"))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .py(px(2.))
-                .cursor_pointer()
-                .hover(|style| style.bg(rgb(theme::BG_HOVER)))
-                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                    toggle.update(cx, |chat, cx| {
-                        let policy = chat.settings.verbosity.policy();
-                        let next = !chat
-                            .open_groups
-                            .get(&toggle_key)
-                            .copied()
-                            .unwrap_or_else(|| policy.group_body_open(running_turn));
-                        chat.open_groups.insert(toggle_key.clone(), next);
-                        cx.notify();
-                    });
-                })
-                .child(icon(
-                    if open {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    },
-                    12.0,
-                    theme::INK_MUTED,
-                ))
-                .child(
-                    div()
-                        .text_size(px(theme::META))
-                        .text_color(rgb(theme::INK_SOFT))
-                        .child(group_label(policy, rows, running_turn)),
-                )
-                .child(div().flex_1());
-            group = group.child(header);
+    /// 把一条规划指令画成元素。整轮 / 过程组的开合交给 [`Self::fold_header`]。
+    fn render_op(&self, op: &RenderOp, cx: &mut Context<Self>) -> AnyElement {
+        match op {
+            RenderOp::Row(row) => self.render_interactive_row(row, cx),
+            RenderOp::Group { spec, rows } => self.render_group(spec, rows, cx).into_any_element(),
+            RenderOp::Turn { spec, inner } => self.render_turn(spec, inner, cx).into_any_element(),
         }
+    }
 
-        if open {
+    /// 一行 reasoning / tool 走可点开版本（接点击）；其余走静态绘制。
+    fn render_interactive_row(&self, row: &TimelineRow, cx: &mut Context<Self>) -> AnyElement {
+        match row {
+            TimelineRow::Reasoning {
+                id,
+                text,
+                streaming,
+            } => self.reasoning_row(id, text, *streaming, cx),
+            TimelineRow::Tool(view) => self.tool_row(view, cx).into_any_element(),
+            other => render_row(other),
+        }
+    }
+
+    /// 整轮控件：控件头插在第一个过程组处；折叠时跳过所有过程组，只留豁免行。
+    fn render_turn(&self, spec: &FoldSpec, inner: &[RenderOp], cx: &mut Context<Self>) -> Div {
+        let mut col = div().flex().flex_col().gap_1();
+        let mut header_drawn = false;
+        for op in inner {
+            if matches!(op, RenderOp::Group { .. }) {
+                if !header_drawn {
+                    col = col.child(self.fold_header(spec, cx));
+                    header_drawn = true;
+                }
+                if spec.open {
+                    col = col.child(self.render_op(op, cx));
+                }
+            } else {
+                // 豁免行（用户输入 / 助手回复）：整轮折叠时仍可见。
+                col = col.child(self.render_op(op, cx));
+            }
+        }
+        if !header_drawn {
+            col = col.child(self.fold_header(spec, cx));
+        }
+        col
+    }
+
+    /// 过程组：组头 + 可选成员行。
+    fn render_group(&self, spec: &FoldSpec, rows: &[TimelineRow], cx: &mut Context<Self>) -> Div {
+        let mut group = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(self.fold_header(spec, cx));
+        if spec.open {
             let mut body = div().flex().flex_col().gap_1().pl(px(16.));
             for row in rows {
-                body = match row {
-                    TimelineRow::Reasoning {
-                        id,
-                        text,
-                        streaming,
-                    } => body.child(self.reasoning_row(id, text, *streaming, cx)),
-                    TimelineRow::Tool(view) => body.child(self.tool_row(view, cx)),
-                    other => body.child(render_row(other)),
-                };
+                body = body.child(self.render_interactive_row(row, cx));
             }
             group = group.child(body);
         }
         group
+    }
+
+    /// 一个折叠容器的头：chevron + 摘要；运行中 / 失败的容器不可收起。
+    fn fold_header(&self, spec: &FoldSpec, cx: &mut Context<Self>) -> Div {
+        let toggle = cx.entity();
+        let key = spec.key.clone();
+        let open = spec.open;
+        let summary = spec.summary.clone();
+        let mut header = div().flex().flex_row().items_center().gap_2().py(px(2.));
+        if spec.collapsible {
+            header = header
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(theme::BG_HOVER)))
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    toggle.update(cx, |chat, cx| {
+                        // spec.open 已含「档位默认 + 现有覆盖」的最终结果，翻转即可。
+                        chat.overrides.set(key.clone(), !open);
+                        cx.notify();
+                    });
+                });
+        }
+        header
+            .child(icon(
+                if open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                },
+                12.0,
+                theme::INK_MUTED,
+            ))
+            .child(
+                div()
+                    .text_size(px(theme::META))
+                    .text_color(rgb(theme::INK_SOFT))
+                    .child(summary),
+            )
+            .child(div().flex_1())
     }
 
     /// 一行 reasoning：默认收起，按档位给不给预览；正文点开后才是纯文本。
@@ -3228,10 +3243,12 @@ impl Chat {
         streaming: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let policy = self.settings.verbosity.policy();
+        let detail = self.settings.verbosity.detail();
         let key = id.label();
-        let open = self.debug_tools_open || self.reasoning_open.get(&key).copied().unwrap_or(false);
-        let preview = reasoning_summary(text, streaming, policy);
+        // 单节点正文默认展开只在 Full（深度 3）；其余档位默认收起，点选优先。
+        let default_open = detail == Detail::Full;
+        let open = self.overrides.node_open(&key, default_open);
+        let preview = reasoning_summary(text, streaming, detail);
         let entity = cx.entity();
         let toggle_key = key.clone();
 
@@ -3243,12 +3260,9 @@ impl Chat {
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 entity.update(cx, |chat, cx| {
-                    let next = !chat
-                        .reasoning_open
-                        .get(&toggle_key)
-                        .copied()
-                        .unwrap_or(false);
-                    chat.reasoning_open.insert(toggle_key.clone(), next);
+                    let detail = chat.settings.verbosity.detail();
+                    let default_open = detail == Detail::Full;
+                    chat.overrides.toggle_node(&toggle_key, default_open);
                     cx.notify();
                 });
             })
@@ -3294,8 +3308,9 @@ impl Chat {
 
     /// 一行工具调用：家族图标 + 名字 + 标题 + 后缀；点开看审计字段与结果。
     fn tool_row(&self, view: &ToolView, cx: &mut Context<Self>) -> Div {
-        // 单个工具正文永远手动展开；档位只决定过程组的默认开合。
-        let open = self.debug_tools_open || self.tool_open.get(&view.id).copied().unwrap_or(false);
+        // 单工具正文默认收起（Full 档默认展开）；档位通过 Overrides 统一表达。
+        let default_open = self.settings.verbosity.detail() == Detail::Full;
+        let open = self.overrides.node_open(&view.id, default_open);
         let entity = cx.entity();
         let id = view.id.clone();
         let stroke = match view.status {
@@ -3312,10 +3327,8 @@ impl Chat {
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 entity.update(cx, |chat, cx| {
-                    chat.tool_open.insert(
-                        id.clone(),
-                        !chat.tool_open.get(&id).copied().unwrap_or(false),
-                    );
+                    let default_open = chat.settings.verbosity.detail() == Detail::Full;
+                    chat.overrides.toggle_node(&id, default_open);
                     cx.notify();
                 });
             })
@@ -4230,91 +4243,12 @@ fn render_row(row: &TimelineRow) -> AnyElement {
     }
 }
 
-/// 组头文案：一行类别统计；运行中按档位换成最后一条工具的实时摘要。
-fn group_label(policy: RenderPolicy, rows: &[TimelineRow], running: bool) -> String {
-    let tools: Vec<&ToolView> = rows
-        .iter()
-        .filter_map(|row| match row {
-            TimelineRow::Tool(view) => Some(view),
-            _ => None,
-        })
-        .collect();
-    if tools.is_empty() {
-        return if running { "思考中" } else { "已思考" }.to_owned();
-    }
-    if policy.show_live_summary(running)
-        && let Some(last) = tools.last()
-        && !last.title.is_empty()
-    {
-        return last.title.clone();
-    }
-    let mut counts: Vec<(&str, usize)> = Vec::new();
-    for tool in &tools {
-        let kind = tool.family.category();
-        match counts.iter_mut().find(|(name, _)| *name == kind) {
-            Some(entry) => entry.1 += 1,
-            None => counts.push((kind, 1)),
-        }
-    }
-    counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
-    counts.truncate(3);
-    counts
-        .into_iter()
-        .map(|(name, count)| format!("{name} {count}"))
-        .collect::<Vec<_>>()
-        .join(" · ")
-}
-
-/// 行的稳定渲染身份；过程组用它做会话内开合键。
-fn row_render_id(row: &TimelineRow) -> RenderId {
-    match row {
-        TimelineRow::User { id, .. }
-        | TimelineRow::Assistant { id, .. }
-        | TimelineRow::Reasoning { id, .. }
-        | TimelineRow::Notice { id, .. } => id.clone(),
-        TimelineRow::Tool(view) => RenderId::Tool(view.id.clone()),
-    }
-}
-
-/// 连续过程行的区间。assistant 正文 / 用户输入 / 提示都会断开过程组。
-fn process_runs(rows: &[TimelineRow]) -> Vec<std::ops::Range<usize>> {
-    let is_process =
-        |row: &TimelineRow| matches!(row, TimelineRow::Reasoning { .. } | TimelineRow::Tool(_));
-    let mut runs = Vec::new();
-    let mut index = 0;
-    while index < rows.len() {
-        if !is_process(&rows[index]) {
-            index += 1;
-            continue;
-        }
-        let start = index;
-        while index < rows.len() && is_process(&rows[index]) {
-            index += 1;
-        }
-        runs.push(start..index);
-    }
-    runs
-}
-
-/// 这一段过程是否属于正在跑的 Turn。
-///
-/// 我们还没有完整的 turn/tail 模型，所以用封闭可观察信号：会话忙 + 本段有
-/// 流式 reasoning 或未收尾工具。历史段在忙时也不会被误判成运行中。
-fn process_group_running(rows: &[TimelineRow], session_busy: bool) -> bool {
-    session_busy
-        && rows.iter().any(|row| match row {
-            TimelineRow::Reasoning { streaming, .. } => *streaming,
-            TimelineRow::Tool(view) => view.status == ToolStatus::Running,
-            _ => false,
-        })
-}
-
 /// reasoning 折叠态的一行摘要。
 ///
 /// 流式取最后一行非空文本（首行往往是开场白，信息量最低），已落定取首行；
-/// Low 档两种都不给摘要。正文始终是纯文本，不解析 markdown。
-fn reasoning_summary(text: &str, streaming: bool, policy: RenderPolicy) -> String {
-    if !policy.show_reasoning_summary() {
+/// Quiet 档（简洁）两种都不给摘要。正文始终是纯文本，不解析 markdown。
+fn reasoning_summary(text: &str, streaming: bool, detail: Detail) -> String {
+    if detail == Detail::Quiet {
         return String::new();
     }
     let line = if streaming {
@@ -4700,11 +4634,11 @@ fn short_id(session: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatVerbosity, ModelGroup, PullRow, SelectedModel, format_tokens, group_label, group_plan,
-        host_status, leaf, model_menu_rows, process_group_running, process_runs, reasoning_summary,
-        short_id, tool_body,
+        ModelGroup, PullRow, SelectedModel, format_tokens, group_plan, host_status, leaf,
+        model_menu_rows, reasoning_summary, short_id, tool_body,
     };
     use crate::{HostLifecycle, ModelOption, SessionInfo, SidebarPrefs};
+    use dsh_protocol::presentation::{Detail, group_summary, plan, process_runs};
     use dsh_protocol::workspace::{WorkspaceRegistry, WorkspaceView};
     use dsh_protocol::{TimelineRow, ToolFamily, ToolResultView, ToolView};
     use std::collections::{HashMap, HashSet};
@@ -4832,6 +4766,13 @@ mod tests {
         }
     }
 
+    fn user_row() -> TimelineRow {
+        TimelineRow::User {
+            id: dsh_protocol::RenderId::User(dsh_protocol::MessageId::Turn { turn: 1, step: 0 }),
+            text: "问题".to_owned(),
+        }
+    }
+
     fn reasoning(body: &str) -> TimelineRow {
         TimelineRow::Reasoning {
             id: dsh_protocol::RenderId::Reasoning {
@@ -4867,37 +4808,68 @@ mod tests {
     }
 
     #[test]
-    fn only_live_process_group_counts_as_running() {
+    fn plan_marks_running_containers_non_collapsible() {
         let mut live = tool("t1");
         let TimelineRow::Tool(ref mut view) = live else {
             unreachable!()
         };
         view.status = dsh_protocol::transcript::ToolStatus::Running;
-        let settled = tool("t2");
-        assert!(process_group_running(&[live], true));
-        assert!(!process_group_running(&[settled], true));
-        assert!(!process_group_running(&[tool("t3")], false));
+        let rows = vec![user_row(), live];
+        let ops = plan(
+            &rows,
+            Detail::Quiet,
+            &dsh_protocol::presentation::Overrides::default(),
+            true, // 会话忙：运行中的一轮恒展开且不可收起
+        );
+        let dsh_protocol::presentation::RenderOp::Turn { spec, .. } = &ops[0] else {
+            panic!("应是整轮");
+        };
+        // 运行中整轮恒展开且不可收起；这就是原 `process_group_running` 的替代。
+        assert!(spec.open);
+        assert!(!spec.collapsible);
     }
 
     #[test]
-    fn reasoning_summary_follows_verbosity_and_stream_state() {
-        let low = ChatVerbosity::Low.policy();
-        let medium = ChatVerbosity::Medium.policy();
-        assert_eq!(reasoning_summary("第一行\n第二行", false, low), "");
-        assert_eq!(reasoning_summary("第一行\n第二行", false, medium), "第一行");
+    fn reasoning_summary_follows_detail_and_stream_state() {
+        assert_eq!(
+            reasoning_summary("第一行\n第二行", false, Detail::Quiet),
+            ""
+        );
+        assert_eq!(
+            reasoning_summary("第一行\n第二行", false, Detail::Brief),
+            "第一行"
+        );
         // 流式取最后一行非空文本，而不是开场白。
-        assert_eq!(reasoning_summary("第一行\n第二行", true, medium), "第二行");
-        assert_eq!(reasoning_summary("第一行", true, medium), "第一行");
-        assert_eq!(reasoning_summary("第一行\n第二行", true, low), "");
+        assert_eq!(
+            reasoning_summary("第一行\n第二行", true, Detail::Standard),
+            "第二行"
+        );
+        assert_eq!(
+            reasoning_summary("第一行", true, Detail::Standard),
+            "第一行"
+        );
+        assert_eq!(reasoning_summary("第一行\n第二行", true, Detail::Quiet), "");
     }
 
     #[test]
-    fn verbosity_controls_group_body_by_default() {
-        assert!(!ChatVerbosity::Low.policy().group_body_open(true));
-        assert!(ChatVerbosity::Medium.policy().group_body_open(true));
-        assert!(!ChatVerbosity::Medium.policy().group_body_open(false));
-        assert!(ChatVerbosity::High.policy().group_body_open(true));
-        assert!(ChatVerbosity::High.policy().group_body_open(false));
+    fn verbosity_controls_default_open_per_layer() {
+        // 每个档位展开一层：简洁折整轮，标准折过程组，详细展开过程组。
+        let rows = vec![user_row(), tool("t1"), text("答")];
+        let open = |detail| {
+            let ops = plan(
+                &rows,
+                detail,
+                &dsh_protocol::presentation::Overrides::default(),
+                false,
+            );
+            let dsh_protocol::presentation::RenderOp::Turn { spec, .. } = &ops[0] else {
+                panic!("应是整轮");
+            };
+            spec.open
+        };
+        assert!(!open(Detail::Quiet));
+        assert!(open(Detail::Brief));
+        assert!(open(Detail::Standard));
     }
 
     /// 组头把 N 条工具压成一行分类统计，运行中高亮最后一条的摘要。
@@ -4910,13 +4882,16 @@ mod tests {
             view.status = dsh_protocol::transcript::ToolStatus::Running;
         }
         let rows = vec![tool("t1"), tool("t2"), third];
-        let low = group_label(ChatVerbosity::Low.policy(), &rows, true);
-        assert!(low.contains("命令 2"), "低档运行中仍给类别统计：{low}");
+        let quiet = group_summary(&rows, true, false);
+        assert!(
+            quiet.contains("命令 2"),
+            "简洁档运行中仍给类别统计：{quiet}"
+        );
 
-        let medium = group_label(ChatVerbosity::Medium.policy(), &rows, true);
-        assert_eq!(medium, "编辑 src/main.rs");
+        let detailed = group_summary(&rows, true, true);
+        assert_eq!(detailed, "编辑 src/main.rs");
 
-        let settled = group_label(ChatVerbosity::Medium.policy(), &rows, false);
+        let settled = group_summary(&rows, false, true);
         assert!(settled.contains("编辑 1"), "分类统计带数量：{settled}");
     }
 

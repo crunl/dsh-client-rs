@@ -102,4 +102,18 @@ mod tests {
         let setting = from_namespace(&view(json!({ FIELD: "bogus" }), None));
         assert_eq!(setting.verbosity, ChatVerbosity::Medium);
     }
+
+    #[test]
+    fn all_four_official_values_round_trip() {
+        for (value, expected) in [
+            ("compact", ChatVerbosity::Low),
+            ("standard", ChatVerbosity::Medium),
+            ("detailed", ChatVerbosity::High),
+            ("verbose", ChatVerbosity::Full),
+        ] {
+            let setting = from_namespace(&view(json!({ FIELD: value }), None));
+            assert_eq!(setting.verbosity, expected, "读 {value}");
+            assert_eq!(expected.host_key(), value, "写 {value}");
+        }
+    }
 }

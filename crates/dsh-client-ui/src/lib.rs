@@ -18,7 +18,7 @@ pub mod settings;
 pub mod theme;
 
 pub use chat::Chat;
-pub use settings::{ChatVerbosity, RenderPolicy, Settings};
+pub use settings::{ChatVerbosity, Settings};
 
 use dsh_protocol::context::Occupancy;
 use dsh_protocol::stream::AssistantStreamFrame;
