@@ -65,9 +65,9 @@ impl Detail {
         matches!(self, Self::Full)
     }
 
-    /// 该档下第 `level` 层容器（0=Turn，1=Group）默认是否展开。
-    const fn layer_open(self, level: u8) -> bool {
-        level < self.depth()
+    /// 该层只用于过程组：Quiet/Brief 组默认收起，Standard 展开。
+    const fn group_open(self) -> bool {
+        self.depth() >= 2
     }
 
     /// 组头是否带运行中实时详情（compact 档不给）。
@@ -234,18 +234,19 @@ fn plan_exchange<'a>(
             inner.push(RenderOp::Row(row));
         }
         let slice = &window[range.clone()];
-        let pin = pin_of(slice, active);
-        let running = pin == Pin::Running;
+        // 组级只认运行中：失败 / 停止的组仍按档位默认开合，用户可再次收起，
+        // 与官方「整轮恒展开但组自身 disclosure 独立」一致。Notice 会断组，到不了这里。
+        let running = active && slice.iter().any(is_running_row);
         let key = FoldKey::Group {
             turn: anchor.clone(),
             ordinal: ordinal as u16,
         };
-        let default_open = detail.layer_open(1);
+        let default_open = detail.group_open();
         let spec = FoldSpec {
             key: key.clone(),
             level: FoldLevel::Group,
-            collapsible: !pin.is_pinned(),
-            open: pin.is_pinned() || over.is_open(&key, default_open),
+            collapsible: !running,
+            open: running || over.is_open(&key, default_open),
             summary: group_summary(slice, running, detail.live_detail()),
         };
         inner.push(RenderOp::Group { spec, rows: slice });
@@ -303,43 +304,42 @@ fn is_running_row(row: &TimelineRow) -> bool {
 /// 容器为何必须保持展开、不给收起入口。
 ///
 /// - `Running`：只在会话忙的活跃轮认，历史残留的 Running 不算（见 `plan` 的 active）；
-/// - `Failed` / `Interrupted`：工具报错或被用户中断，**历史轮也恒展开**——
-///   否则用户看不到失败原因，与官方 `error/aborted/interrupted` 恒展开相反。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// - `Notice`：终态提示钉住整轮，文案直接用提示自身——不把链路失败臆断成「已中断」；
+/// - `Failed` / `Stopped`：只有**最后一个过程行**是失败 / 停止才算这一轮失败收场。
+///   中途失败后重试成功的轮次不该被标成「执行失败」或锁死折叠。
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Pin {
     None,
     Running,
+    Notice(String),
     Failed,
-    Interrupted,
+    Stopped,
 }
 
 impl Pin {
-    fn is_pinned(self) -> bool {
-        self != Self::None
+    fn is_pinned(&self) -> bool {
+        !matches!(self, Self::None)
     }
 }
 
-/// 一段行是否富含「不可收起」的理由；运行中需要 `active` 门，失败与中断不需要。
+/// 一段行是否富含「不可收起」的理由；运行中需要 `active` 门，其余不需要。
 fn pin_of(rows: &[TimelineRow], active: bool) -> Pin {
     if active && rows.iter().any(is_running_row) {
         return Pin::Running;
     }
-    if rows
-        .iter()
-        .any(|row| matches!(row, TimelineRow::Notice { .. }))
-    {
-        return Pin::Interrupted;
-    }
-    if rows.iter().any(|row| {
-        matches!(
-            row,
-            TimelineRow::Tool(view)
-                if matches!(view.status, ToolStatus::Error | ToolStatus::Stopped)
-        )
+    // 终态 Notice（被中断 / 链路失败）钉住整轮；用自身文案避免状态误标。
+    if let Some(text) = rows.iter().rev().find_map(|row| match row {
+        TimelineRow::Notice { text, .. } => Some(text.clone()),
+        _ => None,
     }) {
-        return Pin::Failed;
+        return Pin::Notice(text);
     }
-    Pin::None
+    // 仅当最后一个过程行失败才算这一轮收场失败；中途失败后重试成功不算。
+    match rows.iter().rev().find(|row| is_process_row(row)) {
+        Some(TimelineRow::Tool(view)) if view.status == ToolStatus::Error => Pin::Failed,
+        Some(TimelineRow::Tool(view)) if view.status == ToolStatus::Stopped => Pin::Stopped,
+        _ => Pin::None,
+    }
 }
 
 fn row_label(row: &TimelineRow) -> String {
@@ -384,20 +384,21 @@ pub fn group_summary(rows: &[TimelineRow], running: bool, live_detail: bool) -> 
         .join(" · ")
 }
 
-/// 整轮控件文案：状态 + 工具计数。状态区分工作中 / 已中断 / 执行失败 / 已完成。
+/// 整轮控件文案：状态 + 工具计数。终态用 Notice 自身文案，不臆断成「已中断」。
 fn turn_summary(window: &[TimelineRow], pin: Pin) -> String {
     let tool_count = window
         .iter()
         .filter(|row| matches!(row, TimelineRow::Tool(_)))
         .count();
     let label = match pin {
-        Pin::Running => "工作中",
-        Pin::Interrupted => "已中断",
-        Pin::Failed => "执行失败",
-        Pin::None => "已完成",
+        Pin::Running => "工作中".to_owned(),
+        Pin::Notice(text) => text,
+        Pin::Failed => "执行失败".to_owned(),
+        Pin::Stopped => "已停止".to_owned(),
+        Pin::None => "已完成".to_owned(),
     };
     match tool_count {
-        0 => label.to_owned(),
+        0 => label,
         n => format!("{label} · {n} 次工具"),
     }
 }
@@ -576,6 +577,66 @@ mod tests {
                 assert!(spec.open, "失败轮必须展开 @ {detail:?}");
             }
         }
+    }
+
+    #[test]
+    fn retry_success_turn_stays_collapsible() {
+        // 回归：中途工具失败但重试成功的轮次不是「执行失败」，不该锁死折叠。
+        let mut recovered = tool(1, false);
+        let TimelineRow::Tool(view) = &mut recovered else {
+            unreachable!()
+        };
+        view.status = ToolStatus::Ok;
+        let rows = vec![user(1), failed_tool(1), recovered, assistant(1)];
+        let ops = plan(&rows, Detail::Quiet, &Overrides::default(), false);
+        let RenderOp::Turn { spec, .. } = &ops[0] else {
+            panic!("应是整轮");
+        };
+        assert!(spec.collapsible, "重试成功的轮次应照常可折叠");
+        assert_eq!(spec.summary, "已完成 · 2 次工具");
+    }
+
+    #[test]
+    fn stopped_turn_label_is_not_failure() {
+        let mut stopped = tool(1, false);
+        let TimelineRow::Tool(view) = &mut stopped else {
+            unreachable!()
+        };
+        view.status = ToolStatus::Stopped;
+        let rows = vec![user(1), stopped, assistant(1)];
+        let ops = plan(&rows, Detail::Quiet, &Overrides::default(), false);
+        let RenderOp::Turn { spec, .. } = &ops[0] else {
+            panic!("应是整轮");
+        };
+        assert!(spec.open, "停止的轮次恒展开");
+        assert!(
+            spec.summary.starts_with("已停止"),
+            "不该显示执行失败：{}",
+            spec.summary
+        );
+    }
+
+    #[test]
+    fn notice_uses_own_text_as_turn_label() {
+        // 链路失败之类的 Notice 用自身文案，不臆断成「已中断」。
+        let rows = vec![
+            user(1),
+            tool(1, false),
+            TimelineRow::Notice {
+                id: RenderId::Notice(9),
+                text: "链路中断：连接已丢失".to_owned(),
+            },
+        ];
+        let ops = plan(&rows, Detail::Quiet, &Overrides::default(), false);
+        let RenderOp::Turn { spec, .. } = &ops[0] else {
+            panic!("应是整轮");
+        };
+        assert!(spec.open);
+        assert!(
+            spec.summary.starts_with("链路中断"),
+            "应保留 Notice 自身文案：{}",
+            spec.summary
+        );
     }
 
     #[test]

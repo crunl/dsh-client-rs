@@ -3188,16 +3188,7 @@ impl Chat {
             .gap_1()
             .child(self.fold_header(spec, cx));
         if spec.open {
-            // 官方对过程组设 max-height: min(400px, 50vh) + 内滚，避免一条长过程
-            // 把整页拉长。这里用固定帽；内容仍完整可滚，不丢信息。
-            let mut body = div()
-                .id(format!("group-body:{:?}", spec.key))
-                .flex()
-                .flex_col()
-                .gap_1()
-                .pl(px(16.))
-                .overflow_y_scroll()
-                .max_h(px(400.));
+            let mut body = div().flex().flex_col().gap_1().pl(px(16.));
             for row in rows {
                 body = body.child(self.render_interactive_row(row, cx));
             }
@@ -3330,8 +3321,13 @@ impl Chat {
             ToolStatus::Ok => theme::INK_MUTED,
             ToolStatus::Error | ToolStatus::Stopped => theme::INK,
         };
-        // 失败 / 中断时用结果首行顶替参数派生的标题，折叠行就能看到原因。
-        let title = view.error_summary.as_deref().unwrap_or(&view.title);
+        // 失败 / 中断时把结果首行顶替参数派生的标题，折叠行就能看到原因；
+        // 但命令类工具必须保留「哪条命令失败」——官方对有退出码的行也保留描述。
+        let title = if view.family == ToolFamily::Shell {
+            &view.title
+        } else {
+            view.error_summary.as_deref().unwrap_or(&view.title)
+        };
 
         let row = div()
             .flex()
@@ -4953,8 +4949,9 @@ mod tests {
     }
 
     #[test]
-    fn verbosity_controls_default_open_per_layer() {
-        // 三档都折叠已完成轮；展开后的组层才按档位变化。
+    fn verbosity_folds_completed_turns_at_all_non_flat_layers() {
+        // 官方 foldCompletedTurns：三档都折叠已完成轮（只有 Full 平铺不折）。
+        // 档位差异落在展开后的组层，由 presentation 层的测试单独验证。
         let rows = vec![user_row(), tool("t1"), text("答")];
         let open = |detail| {
             let ops = plan(

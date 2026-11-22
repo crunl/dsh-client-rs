@@ -559,7 +559,8 @@ pub fn tool_view(call: &ToolCall) -> ToolView {
         call.detail
             .lines()
             .next()
-            .map(|line| bounded(line.trim(), 160))
+            .map(|line| redact_text(line.trim()))
+            .map(|line| bounded(&line, 160))
             .filter(|line| !line.is_empty())
     } else {
         None
