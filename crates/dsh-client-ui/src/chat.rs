@@ -3188,7 +3188,16 @@ impl Chat {
             .gap_1()
             .child(self.fold_header(spec, cx));
         if spec.open {
-            let mut body = div().flex().flex_col().gap_1().pl(px(16.));
+            // 官方对过程组设 max-height: min(400px, 50vh) + 内滚，避免一条长过程
+            // 把整页拉长。这里用固定帽；内容仍完整可滚，不丢信息。
+            let mut body = div()
+                .id(format!("group-body:{:?}", spec.key))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .pl(px(16.))
+                .overflow_y_scroll()
+                .max_h(px(400.));
             for row in rows {
                 body = body.child(self.render_interactive_row(row, cx));
             }
@@ -3252,11 +3261,13 @@ impl Chat {
         let entity = cx.entity();
         let toggle_key = key.clone();
 
-        let row = div()
-            .id(format!("reasoning-row:{key}"))
+        // 点击只挂在抬头行：正文可选中复制，不会被「点一下就收起」打断。
+        let mut header = div()
+            .id(format!("reasoning-head:{key}"))
             .flex()
-            .flex_col()
-            .gap_1()
+            .flex_row()
+            .items_center()
+            .gap_2()
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 entity.update(cx, |chat, cx| {
@@ -3266,44 +3277,45 @@ impl Chat {
                     cx.notify();
                 });
             })
+            .child(icon(
+                if open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                },
+                12.0,
+                theme::INK_MUTED,
+            ))
             .child(
                 div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(icon(
-                        if open {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        },
-                        12.0,
-                        theme::INK_MUTED,
-                    ))
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_size(px(theme::META))
-                            .text_color(rgb(theme::INK_MUTED))
-                            .child("思考"),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .overflow_hidden()
-                            .text_size(px(theme::META))
-                            .text_color(rgb(theme::INK_MUTED))
-                            .child(preview),
-                    ),
+                    .flex_shrink_0()
+                    .text_size(px(theme::META))
+                    .text_color(rgb(theme::INK_MUTED))
+                    .child("思考"),
             );
-
+        // 展开后摘要与正文首行重复，只留正文。
         if !open {
-            return row.into_any_element();
+            header = header.child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .text_size(px(theme::META))
+                    .text_color(rgb(theme::INK_MUTED))
+                    .child(preview),
+            );
         }
-        row.child(crate::markdown::text(id.clone(), text, TextRole::Reasoning))
-            .into_any_element()
+
+        let mut col = div()
+            .id(format!("reasoning-row:{key}"))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(header);
+        if open {
+            col = col.child(crate::markdown::text(id.clone(), text, TextRole::Reasoning));
+        }
+        col.into_any_element()
     }
 
     /// 一行工具调用：家族图标 + 名字 + 标题 + 后缀；点开看审计字段与结果。
@@ -4249,16 +4261,80 @@ fn render_row(row: &TimelineRow) -> AnyElement {
 ///
 /// 流式时摘要强制显示（与档位无关，官方 `running || settledReasoningPreview`），
 /// 落定时才按档位给不给预览：简洁档不显示已结算预览。
+/// 摘要算法照官方 `ReasoningRow`：落定取首行，流式取最近完成段落的首行，去 `**`。
 fn reasoning_summary(text: &str, streaming: bool, detail: Detail) -> String {
     if detail == Detail::Quiet && !streaming {
         return String::new();
     }
     let line = if streaming {
-        text.lines().rev().find(|line| !line.trim().is_empty())
+        latest_completed_paragraph_first_line(text)
     } else {
-        text.lines().find(|line| !line.trim().is_empty())
+        first_line(text)
     };
-    line.map(|line| line.trim().to_owned()).unwrap_or_default()
+    line.replace("**", "")
+}
+
+fn first_line(text: &str) -> String {
+    let end = text.find('\n').unwrap_or(text.len());
+    text[..end].trim().to_owned()
+}
+
+/// 官方 `latestCompletedParagraphFirstLine` 的等价实现：段落以空行分隔，
+/// 每跨过一段就锁定它的首行，最终停在最近一个「已写完」的段落。
+/// 这样每个 chunk 不会让摘要在半行 `1.` / `` ``` `` 上跳动。
+fn latest_completed_paragraph_first_line(text: &str) -> String {
+    let mut summary = String::new();
+    let mut paragraph_start = 0usize;
+    loop {
+        let separator = paragraph_separator(text, paragraph_start);
+        let paragraph_end = separator.as_ref().map_or(text.len(), |(end, _)| *end);
+        if let Some(rel) = text[paragraph_start..].find('\n') {
+            let newline = paragraph_start + rel;
+            if newline <= paragraph_end {
+                let candidate = text[paragraph_start..newline].trim();
+                if !candidate.is_empty() {
+                    summary = candidate.to_owned();
+                }
+            }
+        }
+        match separator {
+            Some((_, next_start)) => paragraph_start = next_start,
+            None => return summary,
+        }
+    }
+}
+
+/// 空行段落分隔符：`\r?\n` 后跟至少一行只剩空白的行。返回（首换行位置, 分隔符末尾）。
+fn paragraph_separator(text: &str, from: usize) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i] == b'\n' {
+            let first_newline = i;
+            let mut cursor = i + 1;
+            let mut extra_lines = 0usize;
+            loop {
+                let mut k = cursor;
+                while k < bytes.len() && matches!(bytes[k], b'\t' | b' ') {
+                    k += 1;
+                }
+                if k < bytes.len() && bytes[k] == b'\r' {
+                    k += 1;
+                }
+                if k < bytes.len() && bytes[k] == b'\n' {
+                    extra_lines += 1;
+                    cursor = k + 1;
+                } else {
+                    break;
+                }
+            }
+            if extra_lines > 0 {
+                return Some((first_newline, cursor));
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// 展开区正文：审计字段 + 工具结果，永远是纯文本，不解析 markdown。
@@ -4854,19 +4930,25 @@ mod tests {
             reasoning_summary("第一行\n第二行", false, Detail::Brief),
             "第一行"
         );
-        // 流式取最后一行非空文本，而不是开场白。
+        // 流式无空行时锁在首行，不随每个 chunk 跳动。
         assert_eq!(
             reasoning_summary("第一行\n第二行", true, Detail::Standard),
-            "第二行"
-        );
-        assert_eq!(
-            reasoning_summary("第一行", true, Detail::Standard),
             "第一行"
+        );
+        // 最近完成段落的首行；未完成的那段不算。
+        assert_eq!(
+            reasoning_summary("开场\n\n已完成段落首行\n未完成", true, Detail::Standard),
+            "已完成段落首行"
+        );
+        // 双星号不进摘要（官方 replaceAll('**','')）。
+        assert_eq!(
+            reasoning_summary("**重点**\n其他", false, Detail::Standard),
+            "重点"
         );
         // 简洁档只关「已结算预览」；流式时摘要强制显示，与档位无关。
         assert_eq!(
             reasoning_summary("第一行\n第二行", true, Detail::Quiet),
-            "第二行"
+            "第一行"
         );
     }
 

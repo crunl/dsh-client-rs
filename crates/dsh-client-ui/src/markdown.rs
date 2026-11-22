@@ -1,7 +1,8 @@
 //! 消息正文的渲染入口。
 //!
-//! 第一性原则：**解析角色驱动，排版统一**。只有 assistant 正文走 markdown；
-//! reasoning 与 user/system/tool 都是普通文本，解析 markdown 会改变语义。
+//! 第一性原则：**按角色选排版**。assistant 正文与 reasoning 都走 markdown
+//! （官方 reasoning 展开体即 compact markdown）；只有 user/system/tool 是普通文本，
+//! 解析 markdown 会改变它们的语义。
 //!
 //! 身份来自数据的 [`RenderId`]，不是渲染顺序。流式块和提交后的同一块共用
 //! `(turn, step, index)`，提交那一帧不会重建排版状态。
@@ -17,7 +18,7 @@ use crate::theme;
 pub enum TextRole {
     /// assistant 正文：markdown + 常规墨色。
     Assistant,
-    /// assistant reasoning：纯文本 + 弱墨色。
+    /// assistant reasoning：compact markdown + 弱墨色（列表/加粗/代码按语义渲染）。
     Reasoning,
     /// 用户/系统文本：纯文本 + 常规墨色。
     Plain,
@@ -28,17 +29,23 @@ pub enum TextRole {
 /// `COWORK_RICH_TEXT=0` 时 assistant 也退回纯文本（同一入口的降级分支）；
 /// 量内存/排查排版问题时用，产品默认走 markdown。
 pub fn text(id: RenderId, source: &str, role: TextRole) -> AnyElement {
-    if role != TextRole::Assistant || std::env::var("COWORK_RICH_TEXT").is_ok_and(|v| v == "0") {
+    let markdown = matches!(role, TextRole::Assistant | TextRole::Reasoning);
+    if !markdown || std::env::var("COWORK_RICH_TEXT").is_ok_and(|v| v == "0") {
         return plain(id, source, role);
     }
 
+    let (style, size) = if role == TextRole::Reasoning {
+        (theme::reasoning_markdown_style(), theme::BODY - 1.0)
+    } else {
+        (theme::markdown_style(), theme::BODY)
+    };
     TextView::markdown(
         ElementId::Name(id.label().into()),
         SharedString::from(source.to_owned()),
     )
     .font_family(theme::MONO)
-    .text_size(px(theme::BODY))
-    .style(theme::markdown_style())
+    .text_size(px(size))
+    .style(style)
     .selectable(true)
     .into_any_element()
 }

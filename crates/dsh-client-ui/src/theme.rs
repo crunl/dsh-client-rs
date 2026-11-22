@@ -96,3 +96,8 @@ pub fn markdown_style() -> gpui_kit::base::text::TextViewStyle {
         )
         .with_table_row_hover(rgb(BG_CARD_EDGE).into())
 }
+
+/// reasoning 展开体用的次级排版：同一套 markdown，正文压到弱墨色。
+pub fn reasoning_markdown_style() -> gpui_kit::base::text::TextViewStyle {
+    markdown_style().with_foreground(gpui_kit::rgb(INK_MUTED).into())
+}
