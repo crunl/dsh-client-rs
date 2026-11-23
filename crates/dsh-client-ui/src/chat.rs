@@ -3245,6 +3245,7 @@ impl Chat {
     ) -> AnyElement {
         let detail = self.settings.verbosity.detail();
         let key = id.label();
+        let text = reasoning_text(text);
         // 单节点正文默认展开只在 Full（深度 3）；其余档位默认收起，点选优先。
         let default_open = detail == Detail::Full;
         let open = self.overrides.node_open(&key, default_open);
@@ -4258,6 +4259,41 @@ fn render_row(row: &TimelineRow) -> AnyElement {
 /// 流式时摘要强制显示（与档位无关，官方 `running || settledReasoningPreview`），
 /// 落定时才按档位给不给预览：简洁档不显示已结算预览。
 /// 摘要算法照官方 `ReasoningRow`：落定取首行，流式取最近完成段落的首行，去 `**`。
+/// 官方 reasoning-text.ts 的等价实现：模型 reasoning 首块可能是一整段
+/// `<signature>…</signature>` 签名（不含可读内容），必须过滤，否则展开态会
+/// 露出不可读的签名串。流式未写完签名标签时也压成空，避免闪出半个标签。
+/// 只在首个标签处处理一次——签名只出现在 reasoning 开头。
+fn reasoning_text(text: &str) -> &str {
+    const OPENING: &str = "<signature>";
+    const CLOSING: &str = "</signature>";
+    if text.as_bytes().first() != Some(&b'<') {
+        return text;
+    }
+    // text 还是 `<signature>` 的前缀（流式未写完）：压空，不闪标签。
+    if OPENING.starts_with(text) {
+        return "";
+    }
+    if !text.starts_with(OPENING) {
+        return text;
+    }
+    let Some(end) = text[OPENING.len()..].find(CLOSING) else {
+        return "";
+    };
+    let mut start = OPENING.len() + end + CLOSING.len();
+    let bytes = text.as_bytes();
+    while start < bytes.len() {
+        if bytes[start] == b'\n' {
+            start += 1;
+        } else if bytes[start] == b'\r' && bytes.get(start + 1) == Some(&b'\n') {
+            start += 2;
+        } else {
+            break;
+        }
+    }
+    // start 只会落在 ASCII 标签/换行之后，必是 UTF-8 字符边界。
+    &text[start..]
+}
+
 fn reasoning_summary(text: &str, streaming: bool, detail: Detail) -> String {
     if detail == Detail::Quiet && !streaming {
         return String::new();
@@ -4721,7 +4757,7 @@ fn short_id(session: &str) -> &str {
 mod tests {
     use super::{
         ModelGroup, PullRow, SelectedModel, format_tokens, group_plan, host_status, leaf,
-        model_menu_rows, reasoning_summary, short_id, tool_body, tool_suffix,
+        model_menu_rows, reasoning_summary, reasoning_text, short_id, tool_body, tool_suffix,
     };
     use crate::{HostLifecycle, ModelOption, SessionInfo, SidebarPrefs};
     use dsh_protocol::presentation::{Detail, group_summary, plan, process_runs};
@@ -4917,6 +4953,41 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_text_strips_leading_signature_block() {
+        // 官方 reasoning-text.ts：签名块不是可读内容，展开时不能露出。
+        assert_eq!(
+            reasoning_text("<signature>abc</signature>\n真正的内容"),
+            "真正的内容"
+        );
+        assert_eq!(
+            reasoning_text("<signature>abc</signature>\r\n真正的内容"),
+            "真正的内容"
+        );
+        // 签名为空、无换行。
+        assert_eq!(reasoning_text("<signature>x</signature>"), "");
+        // 签名后多个换行全跳过。
+        assert_eq!(reasoning_text("<signature>x</signature>\n\n\n正文"), "正文");
+    }
+
+    #[test]
+    fn reasoning_text_keeps_normal_and_streaming_prefixes() {
+        assert_eq!(reasoning_text("普通推理"), "普通推理");
+        // 流式中签名标签还没写完：压空，不闪半个标签。
+        assert_eq!(reasoning_text("<sig"), "");
+        assert_eq!(reasoning_text("<signature"), "");
+        assert_eq!(reasoning_text("<"), "");
+        // 非 `<` 开头原样。
+        assert_eq!(reasoning_text(" leading"), " leading");
+        // 有开标签但没闭标签（流式）：压空。
+        assert_eq!(reasoning_text("<signature>还在写"), "");
+        // 不是以签名开头，即使后面出现签名也不动（官方只处理首块）。
+        assert_eq!(
+            reasoning_text("前面<signa</signature>"),
+            "前面<signa</signature>"
+        );
+    }
+
+    #[test]
     fn reasoning_summary_follows_detail_and_stream_state() {
         assert_eq!(
             reasoning_summary("第一行\n第二行", false, Detail::Quiet),
@@ -4971,9 +5042,9 @@ mod tests {
         assert!(!open(Detail::Standard));
     }
 
-    /// 组头把 N 条工具压成一行分类统计，运行中高亮最后一条的摘要。
+    /// 组头把 N 条工具压成一行动作叙述，运行中按档位给实时详情或动作短语。
     #[test]
-    fn group_label_compresses_tools_into_one_line() {
+    fn group_label_uses_official_action_narration() {
         let mut third = tool("t3");
         if let TimelineRow::Tool(view) = &mut third {
             view.family = ToolFamily::FileWrite;
@@ -4982,16 +5053,47 @@ mod tests {
         }
         let rows = vec![tool("t1"), tool("t2"), third];
         let quiet = group_summary(&rows, true, false);
-        assert!(
-            quiet.contains("命令 2"),
-            "简洁档运行中仍给类别统计：{quiet}"
+        assert_eq!(
+            quiet, "正在写入文件",
+            "运行中取当前运行工具的类别，不是最频繁的类别：{quiet}"
         );
 
         let detailed = group_summary(&rows, true, true);
-        assert_eq!(detailed, "编辑 src/main.rs");
+        assert_eq!(
+            detailed, "正在写入文件 · 编辑 src/main.rs",
+            "运行中带实时详情时官方是 label + ' · ' + detail"
+        );
 
         let settled = group_summary(&rows, false, true);
-        assert!(settled.contains("编辑 1"), "分类统计带数量：{settled}");
+        assert_eq!(settled, "执行了命令并已写入文件", "关闭态动作叙述无计数");
+    }
+
+    #[test]
+    fn group_summary_dedupes_kinds_and_caps_at_three() {
+        // 官方 processTitle：top3 动作短语、无计数、多于 3 类追加「等」。
+        use dsh_protocol::timeline::ToolFamily as F;
+        let families = [
+            F::Shell,
+            F::Shell,
+            F::FileRead,
+            F::FileWrite,
+            F::Search,
+            F::Web,
+        ];
+        let rows: Vec<_> = families
+            .iter()
+            .enumerate()
+            .map(|(i, family)| {
+                let mut row = tool(&format!("t{i}"));
+                if let TimelineRow::Tool(view) = &mut row {
+                    view.family = *family;
+                }
+                row
+            })
+            .collect();
+        let label = group_summary(&rows, false, true);
+        assert!(!label.contains('1'), "不显示计数：{label}");
+        assert!(label.ends_with('等'), "多于 3 类追加「等」：{label}");
     }
 
     #[test]

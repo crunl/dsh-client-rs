@@ -74,7 +74,7 @@ pub enum ToolFamily {
 }
 
 impl ToolFamily {
-    /// 组头用的中文类别。
+    /// 组头用的中文类别（工具行等场景仍可能需要名词）。
     pub fn category(self) -> &'static str {
         match self {
             Self::Shell => "命令",
@@ -85,6 +85,35 @@ impl ToolFamily {
             Self::Office => "Office",
             Self::Subagent => "子智能体",
             Self::Unknown => "工具",
+        }
+    }
+
+    /// 关闭态组头的动作短语，对应官方 `message.stepProcess.done.<activity>`。
+    /// 组头只读动作、不显示计数——这是官方 `processTitle` 的语汇。
+    pub fn done_phrase(self) -> &'static str {
+        match self {
+            Self::Shell => "执行了命令",
+            Self::FileRead => "已读取文件",
+            Self::FileWrite => "已写入文件",
+            Self::Search => "已搜索代码",
+            Self::Web => "已访问网页",
+            Self::Office => "已调用工具",
+            Self::Subagent => "已协调子智能体",
+            Self::Unknown => "已调用工具",
+        }
+    }
+
+    /// 运行中且无实时明细时的组头短语，对应官方 `message.stepProcess.<activity>`。
+    pub fn running_phrase(self) -> &'static str {
+        match self {
+            Self::Shell => "正在运行命令",
+            Self::FileRead => "正在读取文件",
+            Self::FileWrite => "正在写入文件",
+            Self::Search => "正在搜索代码",
+            Self::Web => "正在访问网页",
+            Self::Office => "正在调用工具",
+            Self::Subagent => "正在协调子智能体",
+            Self::Unknown => "正在调用工具",
         }
     }
 }

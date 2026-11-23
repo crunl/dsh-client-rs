@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use crate::timeline::{RenderId, TimelineRow};
+use crate::timeline::{RenderId, TimelineRow, ToolFamily};
 use crate::transcript::ToolStatus;
 
 /// 详略档位。两个正交决策的合成：
@@ -263,7 +263,7 @@ fn plan_exchange<'a>(
         level: FoldLevel::Turn,
         collapsible: !turn_pin.is_pinned(),
         open: turn_pin.is_pinned() || over.is_open(&turn_key, default_open),
-        summary: turn_summary(window, turn_pin),
+        summary: turn_summary(turn_pin),
     };
     out.push(RenderOp::Turn {
         spec: turn_spec,
@@ -352,7 +352,11 @@ fn row_label(row: &TimelineRow) -> String {
     }
 }
 
-/// 组头文案：运行中可换最后一条工具标题；否则给类别统计 top3。
+/// 组头文案：官方 `processTitle` 的等价实现。
+///
+/// 关闭态取动作类别 top3 的动作短语（**不带计数**）；运行中且档位给实时详情时
+/// 显示最后一条工具标题，否则显示运行中的动作短语。双类别共享「已」前缀时
+/// 剥掉后者的前缀再用「并」连接；多于 3 类追加「等」。
 pub fn group_summary(rows: &[TimelineRow], running: bool, live_detail: bool) -> String {
     let tools: Vec<_> = rows
         .iter()
@@ -361,45 +365,86 @@ pub fn group_summary(rows: &[TimelineRow], running: bool, live_detail: bool) -> 
             _ => None,
         })
         .collect();
+
+    // 运行中：官方 summary.running 取 time 最大（最近启动）的运行工具。rows 按
+    // 时间顺序，故取最后一个 status==Running 的工具。活动标签用它而非最频繁
+    // 类别——混合组里 5 个完成的读取 + 1 个运行命令应显示「正在运行命令」。
+    if running {
+        let active = tools
+            .iter()
+            .rev()
+            .find(|tool| tool.status == ToolStatus::Running);
+        let label = active
+            .map(|tool| tool.family.running_phrase())
+            .unwrap_or("正在分析请求");
+        // 官方组头运行中 = label + separator(' · ') + detail；detail 取活动工具
+        // 的描述。无运行工具时（纯推理流式）退回末条标题，保持既有行为。
+        if live_detail {
+            let detail = active
+                .or_else(|| tools.last())
+                .filter(|tool| !tool.title.is_empty())
+                .map(|tool| tool.title.as_str());
+            if let Some(detail) = detail {
+                return format!("{label} · {detail}");
+            }
+        }
+        return label.to_owned();
+    }
+
     if tools.is_empty() {
-        return if running { "思考中" } else { "已思考" }.to_owned();
+        return "已完成分析".to_owned();
     }
-    if live_detail && running && tools.last().is_some_and(|tool| !tool.title.is_empty()) {
-        return tools.last().unwrap().title.clone();
-    }
-    let mut counts: Vec<(&str, usize)> = Vec::new();
+
+    // 按类别聚合，计数降序、并列保持首次出现顺序（稳定排序）。
+    let mut counts: Vec<(ToolFamily, usize)> = Vec::new();
     for tool in &tools {
-        let kind = tool.family.category();
-        match counts.iter_mut().find(|(name, _)| *name == kind) {
+        match counts.iter_mut().find(|(family, _)| *family == tool.family) {
             Some(entry) => entry.1 += 1,
-            None => counts.push((kind, 1)),
+            None => counts.push((tool.family, 1)),
         }
     }
     counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
-    counts.truncate(3);
-    counts
-        .into_iter()
-        .map(|(name, count)| format!("{name} {count}"))
-        .collect::<Vec<_>>()
-        .join(" · ")
+
+    let total_kinds = counts.len();
+    let labels: Vec<&str> = counts
+        .iter()
+        .take(3)
+        .map(|(family, _)| family.done_phrase())
+        .collect();
+    match labels.len() {
+        0 => "已完成分析".to_owned(),
+        1 => labels[0].to_owned(),
+        2 => {
+            let first = labels[0];
+            let second = labels[1];
+            let joined = if first.starts_with('已') && second.starts_with('已') {
+                // 官方 sharedPrefix='已'：两者都带前缀时剥掉后者的「已」。
+                &second['已'.len_utf8()..]
+            } else {
+                second
+            };
+            format!("{first}并{joined}")
+        }
+        _ => {
+            let title = labels.join("，");
+            if total_kinds > 3 {
+                format!("{title}等")
+            } else {
+                title
+            }
+        }
+    }
 }
 
-/// 整轮控件文案：状态 + 工具计数。终态用 Notice 自身文案，不臆断成「已中断」。
-fn turn_summary(window: &[TimelineRow], pin: Pin) -> String {
-    let tool_count = window
-        .iter()
-        .filter(|row| matches!(row, TimelineRow::Tool(_)))
-        .count();
-    let label = match pin {
-        Pin::Running => "工作中".to_owned(),
+/// 整轮控件文案，对应官方 `TurnProcessNodeView` 的 label：**只有状态、无工具计数**。
+/// 终态用 Notice 自身文案，不臆断成「已中断」。
+fn turn_summary(pin: Pin) -> String {
+    match pin {
+        Pin::Running => "正在分析请求".to_owned(),
         Pin::Notice(text) => text,
-        Pin::Failed => "执行失败".to_owned(),
+        Pin::Failed => "处理失败".to_owned(),
         Pin::Stopped => "已停止".to_owned(),
         Pin::None => "已完成".to_owned(),
-    };
-    match tool_count {
-        0 => label,
-        n => format!("{label} · {n} 次工具"),
     }
 }
 
@@ -593,7 +638,7 @@ mod tests {
             panic!("应是整轮");
         };
         assert!(spec.collapsible, "重试成功的轮次应照常可折叠");
-        assert_eq!(spec.summary, "已完成 · 2 次工具");
+        assert_eq!(spec.summary, "已完成", "官方抬头只有状态、无工具计数");
     }
 
     #[test]
