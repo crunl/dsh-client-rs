@@ -67,19 +67,24 @@
 dsh runtime 是独立 sidecar，不再算 app 壳的体积（#52）。构建期由
 `scripts/runtime/package-runtime.py` 产出不可变 archive：固定 Node、dsh 生产依赖树、
 `runtime.json` 与唯一入口 `bin/cowork-host`。app 只带 `runtime-manifest.json`，
-启动前校验 archive hash，安装到 `~/.cowork/runtimes/<id>/`，再启动 launcher。
+启动前校验 archive hash，安装到 `$DSH_HOME/profiles/cowork/runtimes/<id>/`，再启动 launcher。
 
 ```text
 cowork.app      → runtime-manifest.json + 可选内嵌 archive
 runtime package → runtime.json + bin/cowork-host + node/ + dsh/
-用户目录        → ~/.cowork/runtimes/<id>/
-用户状态        → ~/.dsh/（与 runtime 分开）
+用户目录        → $DSH_HOME/profiles/cowork/runtimes/<id>/（缺省 ~/.dsh/...）
+用户状态        → $DSH_HOME/（与 runtime 共根；runtime 在其 profiles/cowork/ 下）
 ```
+
+路径解析遵循官方 `@deepseek-ai/dsh-home-paths` 的 `resolveDshHome()`：`DSH_HOME` 优先，
+否则 `~/.dsh`；跨平台 home 与 Node `os.homedir()` 对齐（Windows `USERPROFILE`，
+POSIX `HOME`）。`~/.cowork` 不再使用（#61）。
 
 `legacy` 的 `Resources/runtime/node_modules` 保留为兼容路径，但不是新发行形态。
 
 runtime 生命周期由 `apps/desktop/src/runtime.rs` 统一负责：选择、安装、last_good、
-last_verified 与回收都在 `~/.cowork/state.json` / `~/.cowork/runtimes/` / `~/.cowork/runtime-quarantine/`；
+last_verified 与回收都在 `$DSH_HOME/profiles/cowork/` 下的 `state.json` / `runtimes/` /
+`runtime-quarantine/`；
 `host.rs` 只消费 `ActiveRuntime` 的 argv 并管理进程（#55）。
 
 ## crate 划分

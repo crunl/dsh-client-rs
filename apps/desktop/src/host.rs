@@ -11,9 +11,9 @@
 //!
 //! runtime 的发现、安装、选择、锁、状态与回收都在 `runtime` 模块；这里只看进程。
 
-use crate::runtime::{ActiveRuntime, RuntimeRequest, RuntimeStore};
+use crate::runtime::{ActiveRuntime, RuntimeRequest, RuntimeStore, dsh_home};
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
@@ -91,7 +91,35 @@ pub fn start(store: &RuntimeStore, request: RuntimeRequest) -> Result<Startup, S
 
     let home = dsh_home();
     let profile = std::env::var("COWORK_PROFILE").unwrap_or_else(|_| PROFILE.to_owned());
-    start_isolated(store, request, &home, &profile)
+    let seeded = |h: &Path| {
+        h.join("profiles")
+            .join(&profile)
+            .join("package.json")
+            .exists()
+    };
+    let seeded_before = seeded(&home);
+    let retry = request.clone();
+
+    match start_isolated(store, request, &home, &profile) {
+        Ok(startup) => Ok(startup),
+        Err(error) if should_retry_after_seed(seeded_before, seeded(&home)) => {
+            // 全新用户首次启动：dsh 的 `--from-default-profile` 播种会整体重建
+            // profiles/<profile>/（profile-boot 的 rename→rmSync），连带删掉刚装进去的
+            // runtime，导致本次会话崩溃。此刻播种已完成（package.json 已写出），profile
+            // 稳定；重跑 activate 会经 ensure_installed 从 app 内 archive 幂等重装 runtime，
+            // 第二次启动不再触发播种，正常起来。
+            tracing::warn!(error = %error, "首次播种重建了 runtime，幂等重装后重试一次");
+            start_isolated(store, retry, &home, &profile)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// 首次启动失败是否值得重试：只有「启动前未播种、失败时已播种」才成立。
+/// 此时 dsh 已把 profile 配置落稳，重跑 activate 会幂等重装被播种删掉的 runtime，
+/// 第二次启动不再触发播种。其余组合重试只会掩盖真实错误。
+fn should_retry_after_seed(seeded_before: bool, seeded_after: bool) -> bool {
+    !seeded_before && seeded_after
 }
 
 /// 显式 home/profile 的启动入口，给 verify 用：忽略 `DSH_READY_URL`，不碰用户状态。
@@ -349,19 +377,20 @@ fn extract_ready_url(line: &str) -> Option<String> {
     Some(candidate.to_owned())
 }
 
-/// `$DSH_HOME`，缺省 `~/.dsh`。
-fn dsh_home() -> PathBuf {
-    if let Ok(home) = std::env::var("DSH_HOME") {
-        return PathBuf::from(home);
-    }
-    let user = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned());
-    PathBuf::from(user).join(".dsh")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{redact_token, wait_ready};
+    use super::{redact_token, should_retry_after_seed, wait_ready};
     use std::sync::mpsc::channel;
+
+    #[test]
+    fn seed_retry_only_on_first_boot_transition() {
+        // 只有「首次启动 + 本次播种完成」才重试；已播种或播种未完成都不重试，
+        // 否则会掩盖真实错误或把失败启动重复一遍。
+        assert!(should_retry_after_seed(false, true));
+        assert!(!should_retry_after_seed(false, false));
+        assert!(!should_retry_after_seed(true, true));
+        assert!(!should_retry_after_seed(true, false));
+    }
 
     #[test]
     fn redact_token_hides_the_value_but_keeps_the_shape() {

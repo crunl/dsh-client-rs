@@ -3,7 +3,8 @@
 //! 这是 runtime 的唯一外部 seam。`host` 只拿 [`ActiveRuntime::argv`] 去 spawn，
 //! 不再知道 manifest、tar、锁、状态文件或 legacy node 查找。
 //!
-//! 用户状态留在 `$DSH_HOME`；runtime 状态在 `$COWORK_HOME/.cowork/state.json`。
+//! 用户状态与 runtime 状态都在 `$DSH_HOME`（缺省 `~/.dsh`）；runtime 落在
+//! `$DSH_HOME/profiles/<profile>/runtimes/`，与 dsh profile 共根，不再用 `~/.cowork`。
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,6 +21,97 @@ const BIN_PATH: &str = "node_modules/@deepseek-ai/dsh/lib/bin.js";
 const STATE_FILE: &str = "state.json";
 const RUNTIME_LOCK: &str = "runtime.lock";
 const QUARANTINE_DIR: &str = "runtime-quarantine";
+
+/// 环境变量读取器。生产传 `env::var`，测试传闭包 pin 值——这样路径解析可纯函数测试，
+/// 不必改进程全局 env（Rust 2024 下 `set_var` 是 unsafe 且多线程读写即 UB）。
+type EnvGetter = dyn Fn(&str) -> Option<String>;
+
+/// 解析 dsh home，对齐官方 `@deepseek-ai/dsh-home-paths` 的 `resolveDshHome()`：
+/// `$DSH_HOME`（空白视为未设置）优先，否则 `~/.dsh`；再展开 `~`/`~/` 前缀、
+/// 以 cwd 为基准 `resolve` 成归一化绝对路径。Rust 侧与注入给 dsh 的 DSH_HOME
+/// 必须一致，否则 runtime 与 profile 数据分裂、播种重试守卫失效。
+fn resolve_dsh_home_with(get: &EnvGetter, cwd: &Path) -> PathBuf {
+    let from_env = get("DSH_HOME").filter(|v| !v.trim().is_empty());
+    let selected = from_env
+        .map(PathBuf::from)
+        .unwrap_or_else(|| os_home_with(get).join(".dsh"));
+    normalize_absolute(&expand_home(&selected, &os_home_with(get)), cwd)
+}
+
+/// 跨平台用户主目录，对应 Node `os.homedir()`。
+fn os_home_with(get: &EnvGetter) -> PathBuf {
+    // Node os.homedir(): Windows 用 USERPROFILE（缺失时 HOMEDRIVE+HOMEPATH），
+    // POSIX 用 HOME（缺失时应查 passwd，这里沿用 /tmp 回退）。
+    if cfg!(windows) {
+        if let Some(profile) = get("USERPROFILE").filter(|v| !v.is_empty()) {
+            return PathBuf::from(profile);
+        }
+        if let (Some(drive), Some(path)) = (get("HOMEDRIVE"), get("HOMEPATH")) {
+            return PathBuf::from(format!("{drive}{path}"));
+        }
+    }
+    if let Some(home) = get("HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(home);
+    }
+    PathBuf::from("/tmp")
+}
+
+/// 展开 `~` / `~/` / `~\` 前缀，其余原样返回（对齐官方 `expandHomePath`）。
+fn expand_home(path: &Path, home: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if text == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(rest) = text.strip_prefix("~/").or_else(|| text.strip_prefix("~\\")) {
+        return home.join(rest);
+    }
+    path.to_path_buf()
+}
+
+/// 相对路径以 cwd 为基准转绝对，并词法归一化 `.` / `..`（对齐 Node `path.resolve`）。
+/// 只做词法处理、不要求路径存在，等价于官方 `resolve` 而不触碰文件系统。
+fn normalize_absolute(path: &Path, cwd: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let mut out = PathBuf::new();
+    for component in joined.components() {
+        use std::path::Component;
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// 全进程唯一的 home 解析点；`host.rs` 与 verify 都复用它。
+pub fn dsh_home() -> PathBuf {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    resolve_dsh_home_with(&|key| env::var(key).ok(), &cwd)
+}
+
+/// 产品 profile 名，与 `host::start` 传给 dsh 的 `--profile` 同源（都读 `COWORK_PROFILE`，
+/// 缺省 `cowork`）。runtime 目录必须跟着它走，否则覆盖 profile 时 runtime 与 dsh 数据错位。
+fn profile_name() -> String {
+    env::var("COWORK_PROFILE").unwrap_or_else(|_| "cowork".to_owned())
+}
+
+/// runtime 状态根目录：`<dsh_home>/profiles/<profile>`。其下 `runtimes/`、`state.json`
+/// 等都归本模块管理。dsh 自己把 profile 配置也放这里，但只在播种时整体重建 profile
+/// 目录的内容——runtime 的幂等重装（见 `ensure_installed`）保证它被删后能自愈。
+fn runtime_home_from(dsh_home: &Path, profile: &str) -> PathBuf {
+    dsh_home.join("profiles").join(profile)
+}
+
+pub fn runtime_home() -> PathBuf {
+    runtime_home_from(&dsh_home(), &profile_name())
+}
 
 /// 选择哪个 runtime。调用者只需要给一个封闭请求，不需要知道目录规则。
 #[derive(Debug, Clone)]
@@ -218,11 +310,18 @@ pub struct RuntimeStore {
 
 impl RuntimeStore {
     pub fn from_env() -> Self {
-        let home = env::var("COWORK_HOME")
-            .unwrap_or_else(|_| env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned()));
-        let base = PathBuf::from(home).join(".cowork");
+        Self::at(runtime_home())
+    }
+
+    /// 用显式的 runtime 状态根目录构造，消除第二份路径拼接。
+    fn at(base: PathBuf) -> Self {
+        Self::with_resources(base, resources_dir())
+    }
+
+    /// `at` 的可注入版本；测试传 `None` 隔离真实 app bundle。
+    fn with_resources(base: PathBuf, resources: Option<PathBuf>) -> Self {
         Self {
-            resources: resources_dir(),
+            resources,
             install_root: base.join("runtimes"),
             state_path: base.join(STATE_FILE),
             lock_path: base.join(RUNTIME_LOCK),
@@ -724,10 +823,10 @@ fn cli_verify(args: &[String]) -> Result<String, String> {
     let script = smoke_script_path()?;
     let workspace_root = workspace_root(&script)?;
     let work = temp_workspace(id)?;
-    let dsh_home = work.join("dsh");
-    fs::create_dir_all(&dsh_home)
-        .map_err(|error| format!("创建 {} 失败: {error}", dsh_home.display()))?;
-    let source_home = dsh_home_source();
+    let target_home = work.join("dsh");
+    fs::create_dir_all(&target_home)
+        .map_err(|error| format!("创建 {} 失败: {error}", target_home.display()))?;
+    let source_home = dsh_home();
     if !source_home.is_dir() {
         let _ = fs::remove_dir_all(&work);
         return Err(format!(
@@ -735,13 +834,20 @@ fn cli_verify(args: &[String]) -> Result<String, String> {
             source_home.display()
         ));
     }
-    copy_tree_contents(&source_home, &dsh_home)?;
+    // verify 只需要源 home 的会话/凭据；runtime 安装树（node+dsh，可达数 GB）与隔离区
+    // 由真实 install_root 提供，拷进临时目录纯属浪费——迁移后两者共根，必须显式跳过。
+    let runtime_subtree = Path::new("profiles").join("cowork");
+    let runtimes_rel = runtime_subtree.join("runtimes");
+    let quarantine_rel = runtime_subtree.join(QUARANTINE_DIR);
+    copy_tree_contents(&source_home, &target_home, &|rel| {
+        rel == runtimes_rel || rel == quarantine_rel
+    })?;
 
     let outcome = (|| -> Result<(), String> {
         let startup = crate::host::start_isolated(
             &store,
             RuntimeRequest::Id(id.clone()),
-            &dsh_home,
+            &target_home,
             "cowork",
         )?;
         let url_file = write_ready_url(&work, &startup.ready_url)?;
@@ -769,14 +875,6 @@ fn cli_verify(args: &[String]) -> Result<String, String> {
     Ok(format!(
         "version={version}\nverified={id}\nsuite={suite}\nsmoke=ok\n"
     ))
-}
-
-fn dsh_home_source() -> PathBuf {
-    if let Ok(home) = env::var("DSH_HOME") {
-        return PathBuf::from(home);
-    }
-    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned());
-    PathBuf::from(home).join(".dsh")
 }
 
 fn smoke_script_path() -> Result<PathBuf, String> {
@@ -849,20 +947,26 @@ fn write_ready_url(work: &Path, url: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn copy_tree_contents(src: &Path, dst: &Path) -> Result<(), String> {
+/// 递归复制 src 的内容到 dst。`skip` 收到相对 src 的路径，返回 true 则跳过该项。
+fn copy_tree_contents(src: &Path, dst: &Path, skip: &dyn Fn(&Path) -> bool) -> Result<(), String> {
     let entries =
         fs::read_dir(src).map_err(|error| format!("读取 {} 失败: {error}", src.display()))?;
     for entry in entries {
         let entry = entry.map_err(|error| format!("读取 {} 项失败: {error}", src.display()))?;
         let source = entry.path();
-        let target = dst.join(entry.file_name());
+        let name = entry.file_name();
+        let rel = Path::new(&name);
+        if skip(rel) {
+            continue;
+        }
+        let target = dst.join(rel);
         let meta = fs::symlink_metadata(&source)
             .map_err(|error| format!("读取 {} 元数据失败: {error}", source.display()))?;
         let kind = meta.file_type();
         if kind.is_dir() {
             fs::create_dir_all(&target)
                 .map_err(|error| format!("创建 {} 失败: {error}", target.display()))?;
-            copy_tree_contents(&source, &target)?;
+            copy_tree_contents(&source, &target, &|child| skip(&rel.join(child)))?;
         } else if kind.is_file() {
             fs::copy(&source, &target).map_err(|error| {
                 format!(
@@ -1298,11 +1402,78 @@ fn unix_nanos() -> u128 {
 mod tests {
     use super::{
         CollectMode, RuntimeControl, RuntimeRequest, RuntimeStore, Selection,
-        read_runtime_manifest, sha256_file, target_triple,
+        read_runtime_manifest, resolve_dsh_home_with, runtime_home_from, sha256_file,
+        target_triple,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// 用注入的 env getter + cwd 解析 dsh home，不碰进程全局 env（避免 Rust 2024 下
+    /// `set_var` 的 unsafe 与多线程 UB）。getter 返回 `Some(value)` 表示变量存在。
+    fn pinned_getter(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let owned: Vec<(String, String)> = vars
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |key| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn dsh_home_pin_resolves_runtime_state_under_dsh_profile() {
+        let cwd = Path::new("/volatile/workdir");
+        let pinned = "/volatile/dxg/.dsh";
+        let vars = [("DSH_HOME", pinned)];
+        let home = resolve_dsh_home_with(&pinned_getter(&vars), cwd);
+        assert_eq!(home, Path::new(pinned));
+        let base = runtime_home_from(&home, "cowork");
+        assert_eq!(base, Path::new(pinned).join("profiles").join("cowork"));
+        let store = RuntimeStore::at(base.clone());
+        assert_eq!(store.install_root, base.join("runtimes"));
+        assert_eq!(store.state_path, base.join("state.json"));
+        assert_eq!(store.lock_path, base.join("runtime.lock"));
+        assert_eq!(store.quarantine_root, base.join("runtime-quarantine"));
+    }
+
+    #[test]
+    fn dsh_home_falls_back_to_os_home_and_default_profile() {
+        let cwd = Path::new("/volatile/workdir");
+        let fake_home = "/volatile/fake-home";
+        let vars = [("HOME", fake_home)];
+        let home = resolve_dsh_home_with(&pinned_getter(&vars), cwd);
+        assert_eq!(home, Path::new(fake_home).join(".dsh"));
+        assert_eq!(
+            runtime_home_from(&home, "cowork"),
+            Path::new(fake_home)
+                .join(".dsh")
+                .join("profiles")
+                .join("cowork")
+        );
+    }
+
+    #[test]
+    fn dsh_home_expands_tilde_and_normalizes_relative_path() {
+        let cwd = Path::new("/volatile/workdir");
+        let home_dir = "/volatile/fake-home";
+        // DSH_HOME=~/x 展开为 <home>/x。
+        let tilde = [("DSH_HOME", "~/x"), ("HOME", home_dir)];
+        assert_eq!(
+            resolve_dsh_home_with(&pinned_getter(&tilde), cwd),
+            Path::new(home_dir).join("x")
+        );
+        // 相对路径以 cwd 为基准归一化。
+        let relative = [("DSH_HOME", "./a/../b")];
+        assert_eq!(
+            resolve_dsh_home_with(&pinned_getter(&relative), cwd),
+            cwd.join("b")
+        );
+        // 空白 DSH_HOME 视为未设置，回退 ~/.dsh。
+        let blank = [("DSH_HOME", "   "), ("HOME", home_dir)];
+        assert_eq!(
+            resolve_dsh_home_with(&pinned_getter(&blank), cwd),
+            Path::new(home_dir).join(".dsh")
+        );
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -1315,14 +1486,8 @@ mod tests {
     }
 
     fn store_at(root: &Path) -> RuntimeStore {
-        let base = root.join("home").join(".cowork");
-        RuntimeStore {
-            resources: None,
-            install_root: base.join("runtimes"),
-            state_path: base.join("state.json"),
-            lock_path: base.join("runtime.lock"),
-            quarantine_root: base.join("runtime-quarantine"),
-        }
+        let base = root.join("home").join("profiles").join("cowork");
+        RuntimeStore::with_resources(base, None)
     }
 
     fn install_fake(store: &RuntimeStore, id: &str, profile: Option<&str>) {

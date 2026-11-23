@@ -2427,3 +2427,59 @@ profile 的聊天详略（#57）；新增「归档」Tab 列出归档会话，�
 
 **验证**：`settings.rs` 与 `chat.rs` 单测覆盖策略四旋钮、组头统计/实时摘要、
 推理摘要规则、工具输出过滤；未打 app 包，未做 GUI 验证。
+
+## #61 runtime 状态迁入 dsh profile 目录，弃用 `~/.cowork`
+
+**决策**：runtime 的五个状态路径（install_root / state.json / runtime.lock /
+runtime-quarantine / `.install`/`.download` 临时目录）统一搬到
+`$DSH_HOME/profiles/<profile>/`（缺省 `~/.dsh/profiles/cowork/`），其下保留原有
+`runtimes/` 等子结构；`~/.cowork` 彻底不再使用。路径解析收敛到 `runtime.rs` 的
+`dsh_home()` / `runtime_home()` / `RuntimeStore::at()`，`from_env()`、`host.rs`
+spawn 注入与 verify 源 home 都复用同一处，删除原先分散在 `host.rs`、`runtime.rs`
+verify 与 `COWORK_HOME` 的三份解析。
+
+`dsh_home()` 对齐官方 `@deepseek-ai/dsh-home-paths` 的 `resolveDshHome()`：
+`DSH_HOME` 优先，否则 `~/.dsh`；跨平台 home 与 Node `os.homedir()` 一致
+（Windows `USERPROFILE`，回退 `HOMEDRIVE`+`HOMEPATH`；POSIX `HOME`）。
+profile 名跟随 `COWORK_PROFILE`（缺省 `cowork`），runtime 目录与 dsh 的
+`--profile` 始终同源。
+
+**为什么**：官方 dsh 所有用户数据只有一个根 `.dsh`，没有第二套 `~/.cowork`；
+本机 `.dsh/profiles/cowork` 已随产品播种存在。三场景分发（本机有 node / 全局
+dsh / 无 node）要"装完即用"，单一状态根是最优雅的放置。`~/.cowork` 是 #52
+迁移期的临时兼容目录，runtime package 已正式发布，迁移期结束。
+
+**播种冲突与防护（关键）**：dsh 首次启动 `--from-default-profile web` 时，
+`profile-boot-QhDEDXsF.js:164,173-176` 会把整个 `profiles/<profile>/` `renameSync`
+到 staging 后 `rmSync(recursive)` 重建，连带删掉刚装进去的 runtime，且播种在
+`prepareProfile`（核心加载前）发生，本次会话会崩。防护：`host::start()` 检测
+"启动前未播种、失败时已播种"（package.json 从无到有），自动重跑一次
+`activate`——`ensure_installed` 从 app 内 archive 幂等重装 runtime，第二次启动
+profile 已稳定、不再触发播种。默认 `auto` 路径下，后续启动若 runtime 目录缺失/
+校验失败同样由 `ensure_installed` 重装（runtime 按可重建缓存对待）；但
+`COWORK_RUNTIME_ID`/pin 路径走 `by_id`、不经 `ensure_installed`，被播种删除后
+不会自动重装——首次播种只发生在全新 state（`Auto`），故此边界不在目标时序内。
+
+**修订 #55**：旧文"`~/.dsh` 不写 runtime 选择，`~/.cowork` 不写会话/凭据"
+作废，改为"两者共根于 `$DSH_HOME`、分目录管理：profile 配置与 runtime 状态
+都在 `profiles/cowork/` 下，runtime 自有子目录不与 dsh profile 配置文件混写"。
+`~/Library/Application Support/cowork/state.json` 是侧栏 GUI 缓存，与此无关，
+不在迁移范围。
+
+**行为**：
+- `RuntimeRequest::Id` / `COWORK_RUNTIME_ID` / pin / verify / gc 不变，仍工作；
+  id 来自 manifest，与目录位置解耦，旧归档只要放进新 runtimes 目录即可复用。
+- 不写一次性数据迁移代码：runtime 视为可重建缓存，旧 `~/.cowork` 4.1G 由用户
+  手动清理（gc 只隔离不删除，仍需清 quarantine 与废纸篓）。
+
+**验证**：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --
+-D warnings`、`cargo test --workspace`（161 passed）均通过。路径解析改为注入式纯函数
+（`resolve_dsh_home_with(getter, cwd)` / `runtime_home_from`），测试直接 pin 值、不改
+进程 env（避开 Rust 2024 `set_var` 的 unsafe 与多线程 UB）：
+`dsh_home_pin_resolves_runtime_state_under_dsh_profile` 断言落在
+`<DSH_HOME>/profiles/cowork/runtimes`；`dsh_home_falls_back_to_os_home_and_default_profile`
+覆盖无 DSH_HOME 回退；`dsh_home_expands_tilde_and_normalizes_relative_path` 覆盖
+`~` 展开、相对路径归一化与空白串视为未设置（对齐官方 `resolveDshHome`）。
+`host.rs` 的 `seed_retry_only_on_first_boot_transition` 覆盖播种重试的纯决策。
+verify 复制源 home 时排除 runtime 安装树与隔离区，避免数 GB 无用拷贝。
+headless 环境未做 GUI 目视验证，也未实测全新用户首次播种的完整重装时序。

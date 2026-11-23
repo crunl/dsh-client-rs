@@ -3,7 +3,8 @@
 
 The archive is deliberately opaque to cowork.app.  The app only reads the
 companion runtime-manifest.json, verifies the archive hash, installs it under
-~/.cowork/runtimes/<id>/, and launches bin/cowork-host.
+$DSH_HOME/profiles/<profile>/runtimes/<id>/ (default ~/.dsh/profiles/cowork/runtimes),
+and launches bin/cowork-host.
 """
 
 from __future__ import annotations
