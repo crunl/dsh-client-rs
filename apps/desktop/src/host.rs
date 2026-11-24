@@ -11,15 +11,12 @@
 //!
 //! runtime 的发现、安装、选择、锁、状态与回收都在 `runtime` 模块；这里只看进程。
 
-use crate::runtime::{ActiveRuntime, RuntimeRequest, RuntimeStore, dsh_home};
+use crate::runtime::{ActiveRuntime, RuntimeRequest, RuntimeStore, dsh_home, profile_name};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
-
-/// 产品的 dsh profile 名。会话、工作区、认证都在这个 profile 下。
-pub const PROFILE: &str = "cowork";
 
 /// 新 profile 从哪个内置 profile 播种（`web` 带 HTTP/WS host API）。
 const SEED_PROFILE: &str = "web";
@@ -70,12 +67,14 @@ fn kill_pid(pid: u32) {
     if pid == 0 {
         return;
     }
-    let _ = Command::new("kill")
-        .arg("-9")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    if let Ok(mut command) = crate::trusted_command::trusted_command("kill") {
+        let _ = command
+            .arg("-9")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 /// 拉起自己的 host（开发期可用 `DSH_READY_URL` 直接连外部）；不复用别人的进程（#41）。
@@ -90,7 +89,7 @@ pub fn start(store: &RuntimeStore, request: RuntimeRequest) -> Result<Startup, S
     }
 
     let home = dsh_home();
-    let profile = std::env::var("COWORK_PROFILE").unwrap_or_else(|_| PROFILE.to_owned());
+    let profile = profile_name();
     let seeded = |h: &Path| {
         h.join("profiles")
             .join(&profile)
@@ -158,7 +157,7 @@ pub fn start_isolated(
         "{quoted} & child=$!; echo \"COWORK_HOST_PID=$child\"; \
          while kill -0 $PPID 2>/dev/null; do \
              kill -0 $child 2>/dev/null || exit 0; \
-             sleep 1; \
+             /bin/sleep 1; \
          done; kill -9 $child 2>/dev/null; wait $child 2>/dev/null"
     );
 
@@ -215,6 +214,17 @@ pub fn start_isolated(
             return Err(error);
         }
     };
+
+    // ready 屏障后校验播种的后置条件：dsh 首次播种可能整体重建 profile 目录，
+    // 把刚装好的 launcher 删掉；macOS 删运行中可执行文件不杀进程，host 照样 ready。
+    // 此刻磁盘状态稳定，缺失且匹配清单则幂等重装；失败则精确收拾已起的进程后报错，
+    // 交给 start 的播种重试逻辑兜底。
+    if let Err(error) = store.ensure_active(&launch) {
+        kill_pid(ready.node_pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
 
     tracing::info!(pid = ready.node_pid, watchdog = child.id(), url = %redact_token(&ready.url), "host ready");
     Ok(Startup {

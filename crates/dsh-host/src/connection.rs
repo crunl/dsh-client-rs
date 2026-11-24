@@ -9,7 +9,7 @@ use reqwest::{Client, Response, StatusCode, Url, redirect::Policy};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::mux::Mux;
 
@@ -93,6 +93,10 @@ pub enum HostError {
     /// 连接或握手超时（host 没有响应）。
     #[error("超时：host 没有响应")]
     Timeout,
+    /// 紧随一次握手失败之后：同一批排队的调用直接失败，不重复握手。
+    /// 调用方应在稍后重试（host 可能已恢复）。
+    #[error("WebSocket 握手刚失败，请稍后重试")]
+    RecentHandshakeFailure,
     /// 响应体不是合法的信封。
     #[error("响应无法解析: {source}；原文: {body}")]
     Decode {
@@ -144,6 +148,9 @@ pub struct Connection {
     /// 用异步锁：建 socket 期间持有它，并发调用者排队等同一个结果；
     /// 存的 mux 若已死（socket 断开），下一次 `Mux::of` 会替换它。
     mux: tokio::sync::Mutex<Option<Arc<Mux>>>,
+    /// 最近一次握手失败的时刻：窗口期内让排队的调用者直接失败，不再各自串行重试。
+    /// 与 mux 槽位分开存，避免失败态被「存入成功的 mux」覆盖时被误读。
+    last_handshake_failure: std::sync::Mutex<Option<Instant>>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -194,6 +201,7 @@ impl Connection {
             interactions,
             cookie: std::sync::RwLock::new(String::new()),
             mux: tokio::sync::Mutex::new(None),
+            last_handshake_failure: std::sync::Mutex::new(None),
         };
 
         let cookie = connection.handshake().await?;
@@ -309,7 +317,11 @@ impl Connection {
                 limit: MAX_BODY_BYTES,
             });
         }
-        let body = String::from_utf8_lossy(&bytes).into_owned();
+        // 合法 UTF-8 直接消费 Vec，不额外分配；仅非法分支才走 lossy 重建。
+        let body = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+        };
 
         let parsed: ServerResponse<T> =
             serde_json::from_str(&body).map_err(|source| HostError::Decode {
@@ -358,13 +370,54 @@ impl Connection {
     pub(crate) fn mux(&self) -> &tokio::sync::Mutex<Option<Arc<Mux>>> {
         &self.mux
     }
+
+    /// 记录一次握手失败（当前时刻）。供 mux 的并发调用者 fail-fast 用。
+    pub(crate) fn note_handshake_failure(&self) {
+        if let Ok(mut guard) = self.last_handshake_failure.lock() {
+            *guard = Some(Instant::now());
+        }
+    }
+
+    /// 握手成功后清除失败记忆，让后续调用立即恢复，不必等窗口过期。
+    pub(crate) fn clear_handshake_failure(&self) {
+        if let Ok(mut guard) = self.last_handshake_failure.lock() {
+            *guard = None;
+        }
+    }
+
+    /// 上一次握手失败发生在 `window` 之内吗？没有失败记录时为 false。
+    pub(crate) fn handshake_failed_recently(&self, window: Duration) -> bool {
+        let last = self
+            .last_handshake_failure
+            .lock()
+            .ok()
+            .and_then(|guard| *guard);
+        failure_within_window(last, window)
+    }
+}
+
+/// 纯判断：`at` 是否落在 `window` 窗口内（None 视为无失败）。单测直接 pin 时刻，不依赖时钟。
+fn failure_within_window(at: Option<Instant>, window: Duration) -> bool {
+    at.is_some_and(|at| at.elapsed() < window)
+}
+
+/// 纯判断：声明的 body 长度是否已超过上限（None 表示未知，不触发 fail-fast）。
+fn advertised_exceeds_limit(advertised: Option<u64>, limit: usize) -> bool {
+    advertised.is_some_and(|len| len > limit as u64)
 }
 
 /// 最多读 `limit` 字节，返回（已读字节，是否还有剩余被截掉）。
 ///
 /// 逐块读取，超出上限的部分不会进入内存。
 async fn read_body(mut response: Response, limit: usize) -> Result<(Vec<u8>, bool), HostError> {
-    let mut buf: Vec<u8> = Vec::new();
+    // 声明长度已超限时立即失败，不读 body；否则按声明长度预分配，避免逐块扩容拷贝。
+    // 声明长度不可信（可能缺失或谎报），所以读取循环里仍逐块校验真实字节数。
+    let advertised = response.content_length();
+    if advertised_exceeds_limit(advertised, limit) {
+        return Ok((Vec::new(), true));
+    }
+    let capacity = advertised.unwrap_or(0) as usize;
+    let mut buf: Vec<u8> = Vec::with_capacity(capacity.min(limit));
     while let Some(chunk) = response
         .chunk()
         .await
@@ -408,7 +461,8 @@ fn truncate(mut body: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Connection, HostError};
+    use super::{Connection, HostError, advertised_exceeds_limit, failure_within_window};
+    use std::time::{Duration, Instant};
 
     /// 网络层错误不得把 ready URL 的 token 带进 Display/Debug：
     /// reqwest::Error 默认含请求 URL，而 `/connect` 的 URL 带 token。
@@ -422,5 +476,37 @@ mod tests {
         let text = format!("{error} {error:?}");
         assert!(!text.contains("leak-canary-41"), "token 泄露: {text}");
         assert!(!text.contains("token="), "URL 泄露: {text}");
+    }
+
+    #[test]
+    fn advertised_length_fail_fast_boundary() {
+        assert!(advertised_exceeds_limit(Some(11), 10), "超上限应 fail-fast");
+        assert!(advertised_exceeds_limit(Some(100), 10));
+        assert!(
+            !advertised_exceeds_limit(Some(10), 10),
+            "恰好等于上限应放行"
+        );
+        assert!(!advertised_exceeds_limit(Some(5), 10));
+        assert!(
+            !advertised_exceeds_limit(None, 10),
+            "未知长度交给读取循环校验"
+        );
+    }
+
+    #[test]
+    fn handshake_failure_window_only_fail_fast_recently() {
+        let window = Duration::from_secs(10);
+        assert!(
+            !failure_within_window(None, window),
+            "无失败记录不应 fail-fast"
+        );
+        assert!(
+            failure_within_window(Some(Instant::now()), window),
+            "刚失败应 fail-fast"
+        );
+        assert!(
+            !failure_within_window(Some(Instant::now() - Duration::from_secs(11)), window),
+            "超出窗口应允许重试"
+        );
     }
 }

@@ -2483,3 +2483,78 @@ profile 已稳定、不再触发播种。默认 `auto` 路径下，后续启动�
 `host.rs` 的 `seed_retry_only_on_first_boot_transition` 覆盖播种重试的纯决策。
 verify 复制源 home 时排除 runtime 安装树与隔离区，避免数 GB 无用拷贝。
 headless 环境未做 GUI 目视验证，也未实测全新用户首次播种的完整重装时序。
+
+**订正（#62）**：上段"播种冲突与防护"只覆盖了 Err 分支——`start()` 见到启动失败
+且首次播种刚完成才重跑 `activate`。`RuntimeControl::MarkReady` 本身**不校验 launcher**
+（它只写 `last_good` 与 history，真正校验 launcher 的是 `MarkVerified`），所以 Ok 分支
+长期没有后置条件守卫：macOS 上删除运行中进程的可执行文件不杀进程，host 照样 ready，
+被播种删掉的 launcher 不会被发现。#62 在 ready 屏障后新增 `ensure_active` 补齐 Ok 分支。
+
+## #62 安全加固：PATH 信任根、flock 锁域、ready 后置守卫
+
+**日期**：2026-11-24
+
+**背景**：两路安全审计 + 4 路第一性原则方案收敛，无 critical/high，4 个 medium 全处理，
+并顺带收敛几个共同根因的 low。完整方案见 `docs/SECURITY-HARDENING-PLAN.md`。
+
+**M1 · PATH 劫持两层收敛**。完整性校验的信任根必须在进程内直接作用于待执行字节：
+原生 `sha2` 0.11 替换经 PATH 解析的 `shasum`，重写 `sha256_file`（签名不变，分块读 +
+`Sha256::update` + 小写 hex）。但只修 `shasum` 是虚假安全感——任何经 PATH spawn 的程序
+在被 spawn 瞬间就是 RCE：新增深模块 `trusted_command.rs`，把 `bash`/`kill`/`tar`/`curl`/
+`open` 解析到 SIP 保护的固定系统目录白名单（`/usr/bin` 等），拒绝含路径分隔符的名字，
+找不到即报错、绝不回退 PATH。`curl` 额外加 `--` 终止选项防参数注入；`locate_node` 的裸名
+`"node"` 回退改为固定 `/usr/bin/node`（缺失时明确失败，不静默 exec PATH 里的 node）。
+`/bin/sh`、`active.argv()[0]`（来自已校验安装树）不动。否决逐点硬编码绝对路径、校验
+owner/group（需 FFI）、内建 tar（自研解压是新攻击面）。
+
+**M2 · 一把 flock 收敛锁域**。不变量是「任意时刻至多一个执行者在『检查→修改→发布』
+临界区，且锁所有权与执行者生命周期绑定」。根因是把所有权绑在「文件存在 + PID 存活」
+这种所有者死后仍可被重新解释的用户态数据上。用 `libc::flock` RAII guard 替换自研 PID
+lockfile：锁文件 `runtime.lock` 只作 rendezvous 点、永不 remove，所有权是活 fd 上的
+flock，强退由 OS 关 fd 自动释放——没有 PID 就没有 PID 复用，没有 remove_file 就没有释放
+窗口 TOCTOU。锁从散落的 per-operation 收敛到 `RuntimeStore` 的四个公开 seam
+（`activate`/`status`/`control`/`collect`，外加 `ensure_active`）各持同一把锁，所有 `*_inner`
+与 `ensure_installed`/`install_runtime`/`load_state`/`write_state` 全部无锁、无嵌套 acquire。
+删除 `acquire_pid_lock`/`process_alive`/`with_state_lock` 与 per-id `.install.lock`。等待策略是
+非阻塞 try + 有界 30s + 明确中文错误，绝不无限阻塞。提取纯决策 `plan_install`
+（Current/Replace/Fresh）单测化。`unsafe_code = "deny"` 下只在单个 `flock_fd` 上开
+`#[allow(unsafe_code)]`（唯一 libc FFI，无裸指针）。`instance.rs` 的单实例 socket 语义
+不同（发现已运行并唤起窗口），不动。当前本就 Unix-only（`runtime.rs` 无条件
+`use std::os::unix::fs`），flock 不恶化 Windows 现状。
+
+**M3 · ready 屏障处验证后置条件**。真正的契约是「`start()` 返回 Ok ⇒ runtime 在磁盘上
+可用」，而非「播种发生了吗」。macOS 删除运行中可执行文件不杀进程，host 照样 ready，
+Ok 分支从不校验；且 `MarkReady` 只记 `last_good`、不校验 launcher。在 `host.rs` 的
+`wait_ready` 返回 Ok 之后、构造 `Startup` 之前调用 `RuntimeStore::ensure_active(&launch)`：
+直接检查 launcher 是否还在，缺失且匹配清单则幂等重装；失败则精确收拾已起进程后报错，
+交给 `start` 的播种重试兜底。纯决策 `should_reinstall_after_ready` 四组合单测。Err 分支的
+`should_retry_after_seed` 原样保留，不推翻 #61 的共根决策。
+
+**Low 收敛（共同根因）**：`profile_name()` 提为全进程唯一权威并加净化（仅 ascii
+alphanumeric/`-`/`_`，其余替换为 `-`，杜绝路径穿越），`host.rs`/`main.rs` 复用；新增
+`fsutil::atomic_write`（唯一临时名 + 0600 + create_new + sync_all + rename + 父目录 fsync），
+`runtime.rs::write_state` 与 `cache.rs::save` 共用（净删代码，修复 cache 0644 与固定临时名）；
+`gc_transient` 统一回收 `.bad-*`/`.download`/`.install` 三类残留、各留最新 1 份（此前只清
+`.install`）。`load_state` 保留幂等 bootstrap 写盘——四个 seam 已在顶层持锁，写盘自动在
+锁内，竞态已消除，且现有测试依赖 status 首次建 state（方案原拟改纯读会破坏该契约，故
+按更简洁的收敛处理）。`redact_token` 大小写与 owner/group 校验按 YAGNI 不改。
+
+**验证**：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --
+-D warnings`（唯一 unsafe 例外生效、无其他违规）、`cargo test --workspace`（177 passed，
+较基线 163 增 14）全通过。新增单测：中毒 PATH 回归（假 tar 不被 exec）、`sha256` known
+digest + 多块输入、`trusted_command` 白名单/拒绝、`flock` guard_drop/stale 文件/超时、
+`plan_install` 三态、`gc_transient` 三类各留最新、`should_reinstall_after_ready` 四组合、
+`sanitize_profile` 注入式、原子写两次/无残留/0600。
+
+**复审后补强**：独立复审确认四项 Medium 全部达成、无 Critical/High，并指出一处新引入的
+低风险面——`runtime.lock` 若以默认 0644 创建，同机其他用户可持 `LOCK_SH` 长期阻塞我们的
+`LOCK_EX`（macOS 对只读 fd 也认 SH 锁）。已收敛：Unix 下锁文件创建即 `mode(0o600)`，
+复用旧文件时按 mode 位检测并 `set_permissions` 收紧；新增 `lock_file_is_owner_only` 单测。
+同属 M1 主题，watchdog 脚本的 `sleep 1` 改为 `/bin/sleep 1`（一行防御，避免子进程脚本按
+继承的 PATH 解析外部命令）。复审其余低项按 YAGNI 不改：30s 等待覆盖冷启动下载是可用性
+取舍（GUI 不冻、host 在专用线程，下载出锁需重评并发语义）；fsutil 预置临时名测试偏弱
+（注入文件名生成器是过度工程）；非 Unix 回退裸名（当前 Unix-only 本就编译不过，符合
+"专注 macOS"意图）；`scan_installed` 的 `.bad-` 子串匹配（manifest id 实际不可达）。
+
+**无法 headless 验证（如实记录）**：真实 GUI 首次播种时序、macOS 删除运行中可执行文件后
+host 仍 ready、真多进程 flock 竞争——需真机补验。

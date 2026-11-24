@@ -6,11 +6,14 @@
 //! 用户状态与 runtime 状态都在 `$DSH_HOME`（缺省 `~/.dsh`）；runtime 落在
 //! `$DSH_HOME/profiles/<profile>/runtimes/`，与 dsh profile 共根，不再用 `~/.cowork`。
 
+use crate::fsutil;
+use crate::runtime_lock::RuntimeLockGuard;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -96,10 +99,30 @@ pub fn dsh_home() -> PathBuf {
     resolve_dsh_home_with(&|key| env::var(key).ok(), &cwd)
 }
 
-/// 产品 profile 名，与 `host::start` 传给 dsh 的 `--profile` 同源（都读 `COWORK_PROFILE`，
-/// 缺省 `cowork`）。runtime 目录必须跟着它走，否则覆盖 profile 时 runtime 与 dsh 数据错位。
-fn profile_name() -> String {
-    env::var("COWORK_PROFILE").unwrap_or_else(|_| "cowork".to_owned())
+/// 全进程唯一的 profile 名权威：host 的 `--profile`、runtime 状态根、单实例锁都复用它。
+/// 读 `COWORK_PROFILE`，缺省 `cowork`；拼接进路径前先净化，防止 `../` 等逃出状态根。
+pub fn profile_name() -> String {
+    sanitize_profile(&env::var("COWORK_PROFILE").unwrap_or_default())
+}
+
+/// 注入式纯函数：仅保留 ascii alphanumeric / `-` / `_`，其余替换为 `-`；空则回退 `cowork`。
+/// 与 `instance.rs` 的路径注入防护同源，但两处语义不同（锁文件名 vs 状态根），各留一份。
+fn sanitize_profile(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "cowork".to_owned()
+    } else {
+        cleaned
+    }
 }
 
 /// runtime 状态根目录：`<dsh_home>/profiles/<profile>`。其下 `runtimes/`、`state.json`
@@ -329,7 +352,17 @@ impl RuntimeStore {
         }
     }
 
+    /// 所有公开 seam 共用的一把 flock：所有权绑定活 fd，进程退出由 OS 释放。
+    fn lock(&self) -> Result<RuntimeLockGuard, String> {
+        RuntimeLockGuard::acquire(&self.lock_path)
+    }
+
     pub fn activate(&self, request: RuntimeRequest) -> Result<ActiveRuntime, String> {
+        let _guard = self.lock()?;
+        self.activate_inner(request)
+    }
+
+    fn activate_inner(&self, request: RuntimeRequest) -> Result<ActiveRuntime, String> {
         match request {
             RuntimeRequest::Dir(dir) => legacy_or_package(&dir),
             RuntimeRequest::Id(id) => self.by_id(&id),
@@ -412,7 +445,43 @@ impl RuntimeStore {
         ))
     }
 
+    /// ready 屏障后的播种守卫。start() 返回 Ok 的契约是「runtime 在磁盘上可用」，
+    /// 但 macOS 删除运行中进程的可执行文件不会杀进程：dsh 首次播种会整体重建
+    /// profile 目录，可能把刚装好的 launcher 删掉，host 仍照常 ready。这里直接验证
+    /// 后置条件（launcher 是否还在），缺失且清单匹配则幂等重装。返回 true 表示确实重装。
+    pub fn ensure_active(&self, launch: &ActiveRuntime) -> Result<bool, String> {
+        let _guard = self.lock()?;
+        self.ensure_active_inner(launch)
+    }
+
+    fn ensure_active_inner(&self, launch: &ActiveRuntime) -> Result<bool, String> {
+        let launcher_present = launch
+            .argv()
+            .first()
+            .is_some_and(|arg| Path::new(arg).is_file());
+        let manifest_matches = self
+            .resources
+            .as_ref()
+            .and_then(|res| read_runtime_manifest(&res.join(RUNTIME_MANIFEST)).ok())
+            .is_some_and(|manifest| manifest.id == launch.id());
+        if !should_reinstall_after_ready(launcher_present, manifest_matches) {
+            return Ok(false);
+        }
+        let resources = self
+            .resources
+            .as_ref()
+            .ok_or_else(|| "没有内置 runtime 资源，无法幂等重装".to_owned())?;
+        let manifest = read_runtime_manifest(&resources.join(RUNTIME_MANIFEST))?;
+        self.ensure_installed(&manifest, resources)?;
+        Ok(true)
+    }
+
     pub fn status(&self) -> Result<RuntimeStatus, String> {
+        let _guard = self.lock()?;
+        self.status_inner()
+    }
+
+    fn status_inner(&self) -> Result<RuntimeStatus, String> {
         let state = self.load_state()?;
         let installed = self.scan_installed();
         let desired = self.desired();
@@ -443,135 +512,141 @@ impl RuntimeStore {
     }
 
     pub fn control(&self, command: RuntimeControl) -> Result<(), String> {
-        self.with_state_lock(|| {
-            let mut state = self.load_state()?;
-            let now = now_string();
-            match command {
-                RuntimeControl::Use(Selection::Auto) => {
-                    state.selection = Selection::Auto;
-                    // 显式选择意味着用户接手版本管理；迁移期的一揽子保护到此结束。
-                    state.bootstrap_protected.clear();
-                    push_history(
-                        &mut state,
-                        HistoryEvent {
-                            at: now,
-                            kind: "use-auto".to_owned(),
-                            id: None,
-                            detail: None,
-                        },
-                    );
-                }
-                RuntimeControl::Use(Selection::Pin { id }) => {
-                    validate_runtime_id(&id)?;
-                    installed_launcher(&self.install_root.join(&id), &id)?;
-                    state.selection = Selection::Pin { id: id.clone() };
-                    // 显式选择意味着用户接手版本管理；迁移期的一揽子保护到此结束。
-                    state.bootstrap_protected.clear();
-                    push_history(
-                        &mut state,
-                        HistoryEvent {
-                            at: now,
-                            kind: "use-pin".to_owned(),
-                            id: Some(id),
-                            detail: None,
-                        },
-                    );
-                }
-                RuntimeControl::MarkReady(id) => {
-                    if id.is_empty() || id == "legacy" {
-                        return Ok(());
-                    }
-                    state.last_good = Some(id.clone());
-                    push_history(
-                        &mut state,
-                        HistoryEvent {
-                            at: now,
-                            kind: "ready".to_owned(),
-                            id: Some(id),
-                            detail: None,
-                        },
-                    );
-                }
-                RuntimeControl::MarkVerified { id, suite } => {
-                    validate_runtime_id(&id)?;
-                    installed_launcher(&self.install_root.join(&id), &id)?;
-                    state.last_verified = Some(Verification {
-                        id: id.clone(),
-                        suite,
-                        at: now.clone(),
-                    });
-                    push_history(
-                        &mut state,
-                        HistoryEvent {
-                            at: now,
-                            kind: "verified".to_owned(),
-                            id: Some(id),
-                            detail: None,
-                        },
-                    );
-                }
-            }
-            self.write_state(&state)
-        })
+        let _guard = self.lock()?;
+        self.control_inner(command)
     }
 
-    pub fn collect(&self, mode: CollectMode) -> Result<CollectReport, String> {
-        self.with_state_lock(|| {
-            let mut state = self.load_state()?;
-            let desired = self.desired_id();
-            let protected = self.protected_ids(&state, &desired);
-            let installed = self.scan_installed();
-            let candidates: Vec<String> = installed
-                .iter()
-                .filter(|item| item.view.valid && !protected.contains(&item.id))
-                .map(|item| item.id.clone())
-                .collect();
-
-            let mut moved = Vec::new();
-            if mode == CollectMode::Apply && !candidates.is_empty() {
-                fs::create_dir_all(&self.quarantine_root).map_err(|error| {
-                    format!("创建 {} 失败: {error}", self.quarantine_root.display())
-                })?;
-                let ids: BTreeSet<String> = candidates.iter().cloned().collect();
-                for item in installed {
-                    if !ids.contains(&item.id) {
-                        continue;
-                    }
-                    let target = self
-                        .quarantine_root
-                        .join(format!("{}-{}", item.id, unix_nanos()));
-                    fs::rename(&item.dir, &target).map_err(|error| {
-                        format!(
-                            "隔离 runtime {} 到 {} 失败: {error}",
-                            item.dir.display(),
-                            target.display()
-                        )
-                    })?;
-                    moved.push(item.id);
-                }
-                state.bootstrap_protected.retain(|id| !moved.contains(id));
+    fn control_inner(&self, command: RuntimeControl) -> Result<(), String> {
+        let mut state = self.load_state()?;
+        let now = now_string();
+        match command {
+            RuntimeControl::Use(Selection::Auto) => {
+                state.selection = Selection::Auto;
+                // 显式选择意味着用户接手版本管理；迁移期的一揽子保护到此结束。
+                state.bootstrap_protected.clear();
                 push_history(
                     &mut state,
                     HistoryEvent {
-                        at: now_string(),
-                        kind: "gc".to_owned(),
+                        at: now,
+                        kind: "use-auto".to_owned(),
                         id: None,
-                        detail: Some(moved.join(",")),
+                        detail: None,
                     },
                 );
-                self.write_state(&state)?;
             }
+            RuntimeControl::Use(Selection::Pin { id }) => {
+                validate_runtime_id(&id)?;
+                installed_launcher(&self.install_root.join(&id), &id)?;
+                state.selection = Selection::Pin { id: id.clone() };
+                // 显式选择意味着用户接手版本管理；迁移期的一揽子保护到此结束。
+                state.bootstrap_protected.clear();
+                push_history(
+                    &mut state,
+                    HistoryEvent {
+                        at: now,
+                        kind: "use-pin".to_owned(),
+                        id: Some(id),
+                        detail: None,
+                    },
+                );
+            }
+            RuntimeControl::MarkReady(id) => {
+                if id.is_empty() || id == "legacy" {
+                    return Ok(());
+                }
+                state.last_good = Some(id.clone());
+                push_history(
+                    &mut state,
+                    HistoryEvent {
+                        at: now,
+                        kind: "ready".to_owned(),
+                        id: Some(id),
+                        detail: None,
+                    },
+                );
+            }
+            RuntimeControl::MarkVerified { id, suite } => {
+                validate_runtime_id(&id)?;
+                installed_launcher(&self.install_root.join(&id), &id)?;
+                state.last_verified = Some(Verification {
+                    id: id.clone(),
+                    suite,
+                    at: now.clone(),
+                });
+                push_history(
+                    &mut state,
+                    HistoryEvent {
+                        at: now,
+                        kind: "verified".to_owned(),
+                        id: Some(id),
+                        detail: None,
+                    },
+                );
+            }
+        }
+        self.write_state(&state)
+    }
 
-            Ok(CollectReport {
-                mode: match mode {
-                    CollectMode::DryRun => "dry-run",
-                    CollectMode::Apply => "applied",
+    pub fn collect(&self, mode: CollectMode) -> Result<CollectReport, String> {
+        let _guard = self.lock()?;
+        self.collect_inner(mode)
+    }
+
+    fn collect_inner(&self, mode: CollectMode) -> Result<CollectReport, String> {
+        let mut state = self.load_state()?;
+        let desired = self.desired_id();
+        let protected = self.protected_ids(&state, &desired);
+        let installed = self.scan_installed();
+        let candidates: Vec<String> = installed
+            .iter()
+            .filter(|item| item.view.valid && !protected.contains(&item.id))
+            .map(|item| item.id.clone())
+            .collect();
+
+        let mut moved = Vec::new();
+        if mode == CollectMode::Apply && !candidates.is_empty() {
+            fs::create_dir_all(&self.quarantine_root).map_err(|error| {
+                format!("创建 {} 失败: {error}", self.quarantine_root.display())
+            })?;
+            let ids: BTreeSet<String> = candidates.iter().cloned().collect();
+            for item in installed {
+                if !ids.contains(&item.id) {
+                    continue;
+                }
+                let target = self
+                    .quarantine_root
+                    .join(format!("{}-{}", item.id, unix_nanos()));
+                fs::rename(&item.dir, &target).map_err(|error| {
+                    format!(
+                        "隔离 runtime {} 到 {} 失败: {error}",
+                        item.dir.display(),
+                        target.display()
+                    )
+                })?;
+                moved.push(item.id);
+            }
+            state.bootstrap_protected.retain(|id| !moved.contains(id));
+            push_history(
+                &mut state,
+                HistoryEvent {
+                    at: now_string(),
+                    kind: "gc".to_owned(),
+                    id: None,
+                    detail: Some(moved.join(",")),
                 },
-                protected: protected.into_iter().collect(),
-                candidates,
-                moved,
-                quarantine: self.quarantine_root.clone(),
-            })
+            );
+            self.write_state(&state)?;
+        }
+
+        Ok(CollectReport {
+            mode: match mode {
+                CollectMode::DryRun => "dry-run",
+                CollectMode::Apply => "applied",
+            },
+            protected: protected.into_iter().collect(),
+            candidates,
+            moved,
+            quarantine: self.quarantine_root.clone(),
         })
     }
 
@@ -649,43 +724,10 @@ impl RuntimeStore {
     }
 
     fn write_state(&self, state: &RuntimeState) -> Result<(), String> {
-        if let Some(parent) = self.state_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("创建 {} 失败: {error}", parent.display()))?;
-        }
-        let temp = self
-            .state_path
-            .with_extension(format!("{}.tmp", unix_nanos()));
         let text = serde_json::to_string_pretty(state)
             .map_err(|error| format!("序列化 runtime state 失败: {error}"))?;
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options
-            .open(&temp)
-            .map_err(|error| format!("创建 {} 失败: {error}", temp.display()))?;
-        file.write_all(text.as_bytes())
-            .and_then(|()| file.sync_all())
-            .map_err(|error| format!("写入 {} 失败: {error}", temp.display()))?;
-        drop(file);
-        if let Err(error) = fs::rename(&temp, &self.state_path) {
-            let _ = fs::remove_file(&temp);
-            return Err(format!("替换 {} 失败: {error}", self.state_path.display()));
-        }
-        Ok(())
-    }
-
-    fn with_state_lock<T>(&self, action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-        if let Some(parent) = self.lock_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("创建 {} 失败: {error}", parent.display()))?;
-        }
-        let guard = acquire_pid_lock(&self.lock_path)?;
-        let result = action();
-        drop(guard);
-        let _ = fs::remove_file(&self.lock_path);
-        result
+        fsutil::atomic_write(&self.state_path, text.as_bytes())
+            .map_err(|error| format!("写入 {} 失败: {error}", self.state_path.display()))
     }
 
     fn scan_installed(&self) -> Vec<InstalledInfo> {
@@ -739,28 +781,47 @@ impl RuntimeStore {
         fs::create_dir_all(&self.install_root)
             .map_err(|error| format!("创建 {} 失败: {error}", self.install_root.display()))?;
         let final_dir = self.install_root.join(&manifest.id);
-        if installed_runtime_matches(&final_dir, manifest) {
-            return Ok(final_dir);
+        match plan_install(&final_dir, manifest, unix_nanos()) {
+            InstallPlan::Current => return Ok(final_dir),
+            InstallPlan::Replace { bad } => {
+                fs::rename(&final_dir, &bad).map_err(|error| {
+                    format!("隔离损坏 runtime {} 失败: {error}", final_dir.display())
+                })?;
+            }
+            InstallPlan::Fresh => {}
         }
-        if final_dir.exists() {
-            let bad = self
-                .install_root
-                .join(format!("{}.bad-{}", manifest.id, unix_nanos()));
-            fs::rename(&final_dir, &bad).map_err(|error| {
-                format!("隔离损坏 runtime {} 失败: {error}", final_dir.display())
-            })?;
-        }
-
-        let lock_path = self
-            .install_root
-            .join(format!(".{}.install.lock", manifest.id));
-        let lock = acquire_pid_lock(&lock_path)?;
-        clean_stale_install_dirs(&self.install_root, &manifest.id)?;
-        let result = install_runtime(manifest, resources, &self.install_root, &final_dir);
-        drop(lock);
-        let _ = fs::remove_file(&lock_path);
-        result
+        // 锁由公开的 activate seam 持有，这里无需 per-id 锁。
+        gc_transient(&self.install_root, &manifest.id)?;
+        install_runtime(manifest, resources, &self.install_root, &final_dir)
     }
+}
+
+/// 安装决策的纯函数：当前匹配直接复用；已存在但不匹配则隔离为 `.bad-*`；否则全新安装。
+/// 把最易错的「检查匹配→隔离旧」分支独立出来，便于穷举单测、且无文件系统副作用。
+#[derive(Debug)]
+enum InstallPlan {
+    Current,
+    Replace { bad: PathBuf },
+    Fresh,
+}
+
+fn plan_install(final_dir: &Path, manifest: &RuntimeManifest, now_ns: u128) -> InstallPlan {
+    if installed_runtime_matches(final_dir, manifest) {
+        return InstallPlan::Current;
+    }
+    if final_dir.exists() {
+        return InstallPlan::Replace {
+            bad: final_dir.with_file_name(format!("{}.bad-{}", manifest.id, now_ns)),
+        };
+    }
+    InstallPlan::Fresh
+}
+
+/// ready 屏障后是否要幂等重装：仅当 launcher 已不在、且仍有匹配清单可重装时成立。
+/// launcher 还在说明磁盘状态完好（删除运行中可执行文件不影响进程，但也不该重装）；
+/// 清单不匹配（legacy / 外部 runtime）则无源可重装，重装只会制造错版本。
+fn should_reinstall_after_ready(launcher_present: bool, manifest_matches: bool) -> bool {
+    !launcher_present && manifest_matches
 }
 
 /// CLI adapter。正常 app 启动不经过这里。
@@ -851,7 +912,7 @@ fn cli_verify(args: &[String]) -> Result<String, String> {
             "cowork",
         )?;
         let url_file = write_ready_url(&work, &startup.ready_url)?;
-        let status = Command::new("bash")
+        let status = crate::trusted_command::trusted_command("bash")?
             .arg(&script)
             .arg(&url_file)
             .current_dir(&workspace_root)
@@ -1134,66 +1195,60 @@ fn target_triple() -> &'static str {
     }
 }
 
-fn acquire_pid_lock(path: &Path) -> Result<fs::File, String> {
-    let describe = |error: &std::io::Error| {
-        format!(
-            "无法获取 runtime 锁 {}（另一个操作正在进行？）: {error}",
-            path.display()
-        )
-    };
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            let pid = fs::read_to_string(path)
-                .ok()
-                .and_then(|text| text.trim().parse::<i32>().ok());
-            if let Some(pid) = pid
-                && pid > 0
-                && process_alive(pid)
-            {
-                return Err(format!("runtime 锁被进程 {pid} 持有：{}", path.display()));
-            }
-            let _ = fs::remove_file(path);
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .map_err(|error| describe(&error))?
-        }
-        Err(error) => return Err(describe(&error)),
-    };
-    let _ = writeln!(file, "{}", std::process::id());
-    let _ = file.sync_all();
-    Ok(file)
-}
-
-fn process_alive(pid: i32) -> bool {
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-fn clean_stale_install_dirs(root: &Path, id: &str) -> Result<(), String> {
-    let prefix = format!(".{id}-");
+/// 统一回收三类瞬态残留：`{id}.bad-*`（隔离的损坏 runtime）、`.{id}-*.download`
+/// （未完成下载）、`.{id}-*.install`（未完成安装）。每类按文件名里的时间戳保留
+/// 最新 1 份，其余删除——既不无限堆积，也不误删正在使用的那份。此前只清理
+/// `.install`，崩溃中途的 `.download` 与从未清理的 `.bad-*` 由此一并回收。
+/// `quarantine_root` 是用户可见历史，语义不同，不在此列。
+fn gc_transient(root: &Path, id: &str) -> Result<(), String> {
+    let bad_prefix = format!("{id}.bad-");
+    let transient_prefix = format!(".{id}-");
     let entries = fs::read_dir(root).map_err(|error| format!("读取 runtime 目录失败: {error}"))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("读取 runtime 目录项失败: {error}"))?;
+    let mut bad: Vec<(u128, PathBuf)> = Vec::new();
+    let mut downloads: Vec<(u128, PathBuf)> = Vec::new();
+    let mut installs: Vec<(u128, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&prefix) && name.ends_with(".install") && entry.path().is_dir() {
-            fs::remove_dir_all(entry.path()).map_err(|error| {
-                format!(
-                    "清理未完成 runtime 目录 {} 失败: {error}",
-                    entry.path().display()
-                )
-            })?;
+        if let Some(ts) = name
+            .strip_prefix(&bad_prefix)
+            .and_then(|rest| rest.parse::<u128>().ok())
+        {
+            bad.push((ts, path));
+        } else if let Some(rest) = name.strip_prefix(&transient_prefix) {
+            if let Some(ts) = rest
+                .strip_suffix(".download")
+                .and_then(|s| s.parse::<u128>().ok())
+            {
+                downloads.push((ts, path));
+            } else if let Some(ts) = rest
+                .strip_suffix(".install")
+                .and_then(|s| s.parse::<u128>().ok())
+            {
+                installs.push((ts, path));
+            }
         }
     }
-    Ok(())
+    let keep_newest = |mut group: Vec<(u128, PathBuf)>| -> Result<(), String> {
+        group.sort_by_key(|(ts, _)| *ts);
+        let keep = group.len().saturating_sub(1);
+        for (_, path) in group.into_iter().take(keep) {
+            remove_transient(&path)?;
+        }
+        Ok(())
+    };
+    keep_newest(bad)?;
+    keep_newest(downloads)?;
+    keep_newest(installs)
+}
+
+fn remove_transient(path: &Path) -> Result<(), String> {
+    let result = if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    result.map_err(|error| format!("清理瞬态 {} 失败: {error}", path.display()))
 }
 
 fn install_runtime(
@@ -1253,7 +1308,7 @@ fn install_runtime(
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir)
             .map_err(|error| format!("创建临时 runtime 目录失败: {error}"))?;
-        let status = Command::new("tar")
+        let status = crate::trusted_command::trusted_command("tar")?
             .arg("-xzf")
             .arg(&archive)
             .arg("-C")
@@ -1279,12 +1334,13 @@ fn install_runtime(
 }
 
 fn download_runtime(url: &str, dest: &Path) -> Result<(), String> {
-    let status = Command::new("curl")
+    let status = crate::trusted_command::trusted_command("curl")?
         .arg("-fL")
         .arg("--retry")
         .arg("2")
         .arg("-o")
         .arg(dest)
+        .arg("--")
         .arg(url)
         .status()
         .map_err(|error| format!("下载 runtime 失败: {error}"))?;
@@ -1306,24 +1362,26 @@ fn installed_runtime_matches(dir: &Path, manifest: &RuntimeManifest) -> bool {
     spec.schema == 1 && spec.id == manifest.id && dir.join(launcher).is_file()
 }
 
+/// 进程内计算 SHA-256：信任根直接作用于待执行字节，不经任何经 PATH 解析的外部进程。
+/// 签名保持不变，调用方与现有测试无需改动。
 fn sha256_file(path: &Path) -> Result<String, String> {
-    let output = Command::new("shasum")
-        .arg("-a")
-        .arg("256")
-        .arg(path)
-        .output()
-        .map_err(|error| format!("计算 SHA-256 失败: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "shasum 失败: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
+    let mut file = fs::File::open(path).map_err(|error| format!("打开 runtime 包失败: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|error| format!("读取摘要失败: {error}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.split_whitespace()
-        .next()
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| "shasum 输出为空".to_owned())
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 fn locate_node(runtime: &Path) -> PathBuf {
@@ -1352,7 +1410,9 @@ fn locate_node(runtime: &Path) -> PathBuf {
             return path;
         }
     }
-    PathBuf::from("node")
+    // 绝不用裸名 "node" 回退：它会经 PATH 解析成攻击者可控的二进制，并被 exec。
+    // 返回固定路径，让缺失时 spawn 明确失败，而不是静默执行 PATH 里的 node。
+    PathBuf::from("/usr/bin/node")
 }
 
 fn dir_size(path: &Path) -> u64 {
@@ -1401,10 +1461,12 @@ fn unix_nanos() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CollectMode, RuntimeControl, RuntimeRequest, RuntimeStore, Selection,
-        read_runtime_manifest, resolve_dsh_home_with, runtime_home_from, sha256_file,
+        CollectMode, InstallPlan, RuntimeControl, RuntimeManifest, RuntimeRequest, RuntimeStore,
+        Selection, gc_transient, plan_install, read_runtime_manifest, resolve_dsh_home_with,
+        runtime_home_from, sanitize_profile, sha256_file, should_reinstall_after_ready,
         target_triple,
     };
+    use sha2::Digest;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1684,6 +1746,144 @@ mod tests {
         let status = store.status().unwrap();
         assert_eq!(status.last_good.as_deref(), Some("known"));
         assert_eq!(status.last_verified.unwrap().suite, "smoke-v1");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sha256_handles_multi_chunk_input() {
+        let root = temp_dir("sha256-chunks");
+        let path = root.join("big.bin");
+        // 严格大于 64KB 缓冲区，覆盖 update 的分块路径。
+        let data: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+        fs::write(&path, &data).unwrap();
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&data);
+        let expected: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(sha256_file(&path).unwrap(), expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sanitize_profile_strips_unsafe_chars_and_falls_back() {
+        assert_eq!(sanitize_profile("code"), "code");
+        assert_eq!(sanitize_profile("my-proj_2"), "my-proj_2");
+        // 点号也在净化之列，杜绝 `..` 路径穿越。
+        assert_eq!(sanitize_profile("../etc/passwd"), "---etc-passwd");
+        assert_eq!(sanitize_profile("a/b c.d"), "a-b-c-d");
+        assert_eq!(sanitize_profile(""), "cowork");
+        assert_eq!(sanitize_profile("///"), "---");
+    }
+
+    #[test]
+    fn should_reinstall_after_ready_only_when_launcher_missing_and_manifest_matches() {
+        assert!(should_reinstall_after_ready(false, true));
+        assert!(!should_reinstall_after_ready(true, true));
+        assert!(!should_reinstall_after_ready(false, false));
+        assert!(!should_reinstall_after_ready(true, false));
+    }
+
+    fn test_manifest() -> RuntimeManifest {
+        RuntimeManifest {
+            schema: 1,
+            id: "dsh-test".to_owned(),
+            target: target_triple().to_owned(),
+            archive: "runtime.tar.gz".to_owned(),
+            sha256: "deadbeef".to_owned(),
+            size: 42,
+            launcher: "bin/cowork-host".to_owned(),
+            url: None,
+            profile: None,
+            exclusions: None,
+        }
+    }
+
+    #[test]
+    fn plan_install_covers_current_replace_and_fresh() {
+        let root = temp_dir("plan-install");
+        let manifest = test_manifest();
+        let final_dir = root.join(&manifest.id);
+
+        // Fresh：目标不存在。
+        assert!(matches!(
+            plan_install(&final_dir, &manifest, 1),
+            InstallPlan::Fresh
+        ));
+
+        // Replace：目录存在但内容不匹配。
+        fs::create_dir_all(&final_dir).unwrap();
+        fs::write(final_dir.join("runtime.json"), b"{}").unwrap();
+        match plan_install(&final_dir, &manifest, 99) {
+            InstallPlan::Replace { bad } => {
+                assert!(bad.to_string_lossy().contains("dsh-test.bad-99"));
+            }
+            other => panic!("期望 Replace，得到 {other:?}"),
+        }
+
+        // Current：安装内容与清单匹配。
+        fs::remove_dir_all(&final_dir).unwrap();
+        install_fake_at(&final_dir, "dsh-test");
+        assert!(matches!(
+            plan_install(&final_dir, &manifest, 7),
+            InstallPlan::Current
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn install_fake_at(dir: &Path, id: &str) {
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        fs::write(dir.join("bin/cowork-host"), "#!/bin/sh\n").unwrap();
+        fs::write(
+            dir.join("runtime.json"),
+            format!("{{\"schema\":1,\"id\":\"{id}\",\"launcher\":\"bin/cowork-host\"}}"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn gc_transient_keeps_only_newest_of_each_kind() {
+        let root = temp_dir("gc-transient");
+        let id = "dsh-gc";
+        // 三类各造新旧两份（时间戳写进名字）。
+        for (kind, old, new) in [
+            ("bad", format!("{id}.bad-100"), format!("{id}.bad-200")),
+            (
+                "download",
+                format!(".{id}-100.download"),
+                format!(".{id}-200.download"),
+            ),
+            (
+                "install",
+                format!(".{id}-100.install"),
+                format!(".{id}-200.install"),
+            ),
+        ] {
+            let _ = kind;
+            let old_path = root.join(&old);
+            let new_path = root.join(&new);
+            if old.ends_with(".install") || old.contains(".bad-") {
+                fs::create_dir_all(&old_path).unwrap();
+                fs::create_dir_all(&new_path).unwrap();
+            } else {
+                fs::write(&old_path, b"old").unwrap();
+                fs::write(&new_path, b"new").unwrap();
+            }
+        }
+        // 合法 runtime 目录不能被回收。
+        install_fake_at(&root.join(id), id);
+
+        gc_transient(&root, id).unwrap();
+
+        assert!(!root.join(format!("{id}.bad-100")).exists());
+        assert!(root.join(format!("{id}.bad-200")).exists());
+        assert!(!root.join(format!(".{id}-100.download")).exists());
+        assert!(root.join(format!(".{id}-200.download")).exists());
+        assert!(!root.join(format!(".{id}-100.install")).exists());
+        assert!(root.join(format!(".{id}-200.install")).exists());
+        assert!(root.join(id).join("bin/cowork-host").is_file());
         fs::remove_dir_all(root).unwrap();
     }
 }

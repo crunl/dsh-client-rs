@@ -56,6 +56,12 @@ futures-util = "0.3"
 # ── 标识 ──────────────────────────────────────────────────────────────────
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# ── 完整性校验 / 文件锁（均在 Cargo.lock，零新增编译单元）──────────────────
+# sha2 0.11 用于进程内 SHA-256（替换经 PATH 解析的 shasum，收紧信任根）。
+sha2 = "0.11"
+# libc 仅用于单个 libc::flock 封装（runtime 状态锁；std 无稳定文件锁 API）。
+libc = "0.2"
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 

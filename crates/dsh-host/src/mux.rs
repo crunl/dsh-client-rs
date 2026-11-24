@@ -24,6 +24,11 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::COOKIE;
 use tokio_tungstenite::{MaybeTlsStream, connect_async};
 
+/// 握手失败后的 fail-fast 窗口：失败释放锁的瞬间，等待中的一批调用者会依次拿到锁，
+/// 这段窗口让它们直接失败、不再各自串行握手。取 1s——远小于 `WS_HANDSHAKE_TIMEOUT`
+/// （10s），足以覆盖同一批排队者，又不会误伤稍后的正常重试（如每 2s 的 workspace/follow）。
+const HANDSHAKE_FAILURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// 一条逻辑流的读端。
 pub struct Subscription {
     id: String,
@@ -73,15 +78,37 @@ impl Mux {
         if let Some(mux) = slot.as_ref().filter(|mux| !mux.is_closed()) {
             return Ok(Arc::clone(mux));
         }
+
+        // 上一次握手刚失败（含 401→refresh→再握手那条路径）：窗口期内排队的调用者
+        // 直接失败，不再各自串行握手——否则 N 个调用者会阻塞 N × 握手超时。
+        if conn.handshake_failed_recently(HANDSHAKE_FAILURE_WINDOW) {
+            return Err(HostError::RecentHandshakeFailure);
+        }
+
         let socket = match handshake(conn).await {
-            Err(error) if Connection::is_unauthorized(&error) => {
-                conn.refresh().await?;
-                handshake(conn).await?
+            Err(error) if Connection::is_unauthorized(&error) => match conn.refresh().await {
+                Ok(()) => match handshake(conn).await {
+                    Ok(socket) => socket,
+                    Err(error) => {
+                        conn.note_handshake_failure();
+                        return Err(error);
+                    }
+                },
+                Err(error) => {
+                    conn.note_handshake_failure();
+                    return Err(error);
+                }
+            },
+            Err(error) => {
+                conn.note_handshake_failure();
+                return Err(error);
             }
-            other => other?,
+            Ok(socket) => socket,
         };
         let mux = Arc::new(Self::start(socket));
         *slot = Some(Arc::clone(&mux));
+        // 握手成功：清除失败记忆，后续调用立即恢复，不必等窗口过期。
+        conn.clear_handshake_failure();
         Ok(mux)
     }
 

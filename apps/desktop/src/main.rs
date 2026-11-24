@@ -15,13 +15,16 @@
 //! `_UNARCHIVE`），含义见 `crates/dsh-client-ui/src/lib.rs` 与 docs/DECISIONS.md。
 
 mod cache;
+mod fsutil;
 mod host;
 mod host_settings;
 mod instance;
 mod model_settings;
 mod runtime;
+mod runtime_lock;
+mod trusted_command;
 
-use runtime::{RuntimeControl, RuntimeRequest, RuntimeStore};
+use runtime::{RuntimeControl, RuntimeRequest, RuntimeStore, profile_name};
 
 use dsh_client_ui::completion;
 use dsh_client_ui::{
@@ -87,7 +90,7 @@ fn main() {
     let sidebar_prefs = Arc::new(Mutex::new(initial_prefs));
 
     // 同一个 profile 只开一个窗口进程：双击两次不该起两个 host 抢同一个 DSH_HOME。
-    let profile = std::env::var("COWORK_PROFILE").unwrap_or_else(|_| host::PROFILE.to_owned());
+    let profile = profile_name();
     let guard = match instance::acquire(&profile) {
         instance::Acquired::Guard(guard) => guard,
         instance::Acquired::AlreadyRunning => {
@@ -96,8 +99,9 @@ fn main() {
             if let Some(bundle) = std::env::current_exe()
                 .ok()
                 .and_then(|exe| exe.ancestors().nth(3).map(std::path::Path::to_path_buf))
+                && let Ok(mut command) = trusted_command::trusted_command("open")
             {
-                let _ = std::process::Command::new("open").arg(bundle).status();
+                let _ = command.arg(bundle).status();
             }
             return;
         }

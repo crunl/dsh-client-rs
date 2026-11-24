@@ -224,27 +224,17 @@ pub fn load() -> Option<Snapshot> {
     }
 }
 
-/// 写快照：先写临时文件再 rename，避免半截文件。
+/// 写快照：走共享的原子写（唯一临时名 + 0600 + fsync + rename），避免半截文件。
 pub fn save(snapshot: &Snapshot) {
     let Some(path) = path() else {
         tracing::warn!("拿不到家目录，快照不写");
         return;
     };
-    let Some(parent) = path.parent() else { return };
-    if let Err(error) = std::fs::create_dir_all(parent) {
-        tracing::warn!(%error, "建快照目录失败");
-        return;
-    }
     let Ok(text) = serde_json::to_string(snapshot) else {
         return;
     };
-    let temp = path.with_extension("json.tmp");
-    if let Err(error) = std::fs::write(&temp, text) {
+    if let Err(error) = crate::fsutil::atomic_write(&path, text.as_bytes()) {
         tracing::warn!(%error, "写快照失败");
-        return;
-    }
-    if let Err(error) = std::fs::rename(&temp, &path) {
-        tracing::warn!(%error, "替换快照失败");
     }
 }
 

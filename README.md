@@ -95,7 +95,7 @@ cowork.app/Contents/
 | `profile` | `code` | **打包标记**：用了 code 裁剪 profile |
 | `url` / `exclusions` | `""` / 逐类排除计数 | 内嵌包无需下载；排除项含 source map 9,947、TypeScript 声明 25,494 等 |
 
-归档解开后是固定 Node + dsh 0.2.2-rc.5 生产依赖 + `runtime.json` + `bin/cowork-host`。app 启动前校验 size / SHA-256，再解压安装——安装中途留 `.install` 临时目录，锁带 PID，损坏目录先隔离再重装。
+归档解开后是固定 Node + dsh 0.2.2-rc.5 生产依赖 + `runtime.json` + `bin/cowork-host`。app 启动前校验 size / SHA-256（进程内原生计算，不经 PATH），再解压安装——安装中途留 `.install` 临时目录，操作由一把 flock 串行化（锁只绑定活 fd，无 PID 复用问题），损坏目录先隔离再重装。
 
 **关于 code profile**（DECISIONS #54）：它是官方"保守裁剪、不删功能"的 profile——只删 source map、`.d.ts`、跨平台 / 构建垃圾，**不删 Office / WASM / 语音等功能包，功能与 full 等价**，压缩体积比 full 少约 91MB（归档字节数：full 345,334,176 B ≈ 329 MiB、code 254,025,459 B ≈ 242 MiB；十进制口径常写作 329M / 257M），展开后约 1.1G。`profile: code` 只是告诉运行时"这是裁剪包"，不要和 full 混用同一目录。
 
@@ -105,7 +105,7 @@ cowork.app/Contents/
 $DSH_HOME/profiles/cowork/          ← DSH_HOME 缺省为 ~/.dsh（#61）
 ├─ runtimes/<runtime-id>/           ← 解压安装好的 runtime（可重建缓存）
 ├─ state.json                       ← 选择 / last_good / last_verified / 历史
-├─ runtime.lock                     ← 带 PID 的操作锁
+├─ runtime.lock                     ← flock 操作锁（只作 rendezvous 点，不含 PID）
 └─ runtime-quarantine/              ← 损坏 / 回收的 runtime 先隔离，不直接删
 ```
 
