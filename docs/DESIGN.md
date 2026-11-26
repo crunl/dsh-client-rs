@@ -530,6 +530,10 @@ tool/call   {turn, step, callId, name, arguments}      ┐
 真值在 dsh host profile 的 `ui-chat.transcriptView`，启动读 `settings/describe`，
 点击经 `settings/update` 写回，客户端只保留内存镜像。
 
+设置侧栏是一层平铺的导航：不可点的小标题（`通用` / `数据`）分组，组内条目是
+`Tabs` 的 tab。`通用 → 常规` 用一条四档滑块改详略，`通用 → 模型` 管 provider，
+`数据 → 归档` 管归档会话（见 DECISIONS #63）。
+
 ### 助手正文的 markdown
 
 **解析与渲染都不自己写**，也不引 Zed（GPL-3.0 + 拖整个编辑器）：用 `gpui-base`

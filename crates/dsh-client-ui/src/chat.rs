@@ -8,6 +8,11 @@
 
 use dsh_protocol::workspace::WorkspaceRegistry;
 use gpui_kit::base::input::{InputEditorStyle, InputEvent, Textarea, TextareaState};
+use gpui_kit::base::slider::{
+    Slider, SliderEvent, SliderIndicator, SliderState, SliderThumb, SliderTrack,
+};
+use gpui_kit::base::{Tab, Tabs};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -26,13 +31,48 @@ use dsh_protocol::transcript::ToolStatus;
 use dsh_protocol::{ChatTimeline, RenderId, TimelineRow, ToolFamily, ToolResultView, ToolView};
 use gpui_kit::assets::IconName;
 
-/// 设置模式的三个应用级视图：偏好、模型与归档会话。
+/// 设置模式的三个应用级视图：通用（对话详略）、模型、归档会话。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum SettingsTab {
     #[default]
     General,
     Models,
     Archive,
+}
+
+impl SettingsTab {
+    /// 侧栏导航的分组表：组名不可点，组内条目才是 tab。空分组不显示组名。
+    const SECTIONS: [(&'static str, &'static [Self]); 2] = [
+        ("通用", &[Self::General, Self::Models]),
+        ("数据", &[Self::Archive]),
+    ];
+
+    /// 稳定键，只用于控件 id。
+    const fn key(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::Models => "models",
+            Self::Archive => "archive",
+        }
+    }
+
+    /// 导航条目的标签。
+    const fn label(self) -> &'static str {
+        match self {
+            Self::General => "常规",
+            Self::Models => "模型",
+            Self::Archive => "归档",
+        }
+    }
+
+    /// 导航条目的图标；只用默认资源包里内嵌的 Lucide 名字。
+    const fn icon(self) -> IconName {
+        match self {
+            Self::General => IconName::Settings2,
+            Self::Models => IconName::Cpu,
+            Self::Archive => IconName::Inbox,
+        }
+    }
 }
 
 /// 主视图。
@@ -68,10 +108,14 @@ pub struct Chat {
     settings_saved: bool,
     /// settings 页面是否覆盖主区。
     settings_open: bool,
-    /// 设置模式当前选中的叶子（偏好→聊天 / 会话→归档）。
+    /// 设置模式当前选中的叶子（通用→常规 / 模型 / 数据→归档）。
     settings_tab: SettingsTab,
-    /// 设置树分组的展开状态：key 为 `prefs` / `sessions`。缺省展开。
-    settings_tree: HashMap<String, bool>,
+    /// 「常规」页的详略滑块。四档是四个整数步，拖动只改它的值；
+    /// 写 host 由 `SliderEvent::Release` 触发，与旧的分段按钮同一路径。
+    verbosity_slider: Entity<SliderState>,
+    /// 权威值（启动读取 / 写回回送 / 失败回滚）与滑块当前值不一致时记在这里，
+    /// 下一次渲染时推给滑块：`set_value` 需要 `Window`，而事件处理没有。
+    verbosity_slider_sync: Option<ChatVerbosity>,
     /// 模型设置页：可配置 provider 的快照。
     model_settings: Vec<ProviderSetting>,
     /// 模型设置页读取失败说明；成功为 `None`。
@@ -119,6 +163,8 @@ pub struct Chat {
     pending_session_delete: Option<String>,
     /// 按键拦截器的订阅；丢掉就失效，所以必须攥在手里。
     _completion_keys: Subscription,
+    /// 详略滑块的订阅；同上，丢掉就收不到 `Release`。
+    _slider: Subscription,
     /// 当前会话的权限 preset（composer 左侧 mode）。
     mode: String,
     /// 可选 preset 目录。
@@ -431,6 +477,27 @@ impl Chat {
             },
         );
 
+        // 详略滑块：四档就是 0..=3 的整数步，默认值与 `Settings::default()` 一致。
+        // 拖动只改滑块值；松手（Release）才写 host，避免拖动途中连发 mutation。
+        let verbosity_slider = cx.new(|_| {
+            SliderState::new()
+                .min(0.)
+                .max((ChatVerbosity::ALL.len() - 1) as f32)
+                .step(1.)
+                .default_value(ChatVerbosity::default().index() as f32)
+        });
+        let slider = cx.subscribe(
+            &verbosity_slider,
+            |chat: &mut Self, _slider, event: &SliderEvent, cx| match event {
+                // 拖动途中只重画拇指与填充条：值已经写进滑块状态，但本视图不知道。
+                SliderEvent::Change(_) => cx.notify(),
+                // 松手才是一次完整的用户意图，这一步写 host。
+                SliderEvent::Release(value) => {
+                    chat.commit_verbosity(ChatVerbosity::from_index(value.end() as usize), cx);
+                }
+            },
+        );
+
         cx.spawn(async move |this, cx| {
             while let Some(event) = events.recv().await {
                 if this
@@ -483,7 +550,8 @@ impl Chat {
             settings_saved: false,
             settings_open: false,
             settings_tab: SettingsTab::default(),
-            settings_tree: HashMap::new(),
+            verbosity_slider,
+            verbosity_slider_sync: None,
             model_settings: Vec::new(),
             model_settings_error: None,
             model_settings_writable: false,
@@ -533,6 +601,7 @@ impl Chat {
             hover_composer: false,
             hover_panel: false,
             _completion_keys: completion_keys,
+            _slider: slider,
             _enter: enter,
         }
     }
@@ -1058,12 +1127,24 @@ impl Chat {
             .child(self.side_close(cx))
     }
 
-    /// 设置导航树：两组（偏好 / 会话）可折叠，叶子选中切换主区；偏好按真值归属分组。
+    /// 设置导航：一层平铺，分组标题不可点，组内条才是 tab。
+    ///
+    /// 结构对齐官方 settings 侧栏（`Agent 能力` / `数据与统计` 那种小节标题 +
+    /// 组内条目），但不做折叠：条目数量少，折叠只是多一次点击。
     fn settings_side_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let back = cx.entity();
-        let prefs_open = self.settings_tree.get("prefs").copied().unwrap_or(true);
-        let sessions_open = self.settings_tree.get("sessions").copied().unwrap_or(true);
-        let mut body = div()
+        let mut tabs = Tabs::new("settings-nav").axis(Axis::Vertical);
+        for (index, (section, entries)) in SettingsTab::SECTIONS.iter().enumerate() {
+            if entries.is_empty() {
+                continue;
+            }
+            tabs = tabs.child(self.settings_nav_section(section, index == 0));
+            for tab in entries.iter().copied() {
+                tabs = tabs.child(self.settings_nav_tab(tab, cx));
+            }
+        }
+
+        div()
             .id("settings-side-body")
             .flex()
             .flex_col()
@@ -1092,147 +1173,67 @@ impl Chat {
                     .text_color(rgb(theme::INK_SOFT))
                     .child("← 返回工作区"),
             )
-            .child(self.settings_tree_group("prefs", "偏好", cx));
-        if prefs_open {
-            body = body.child(div().pl(px(22.)).child(self.settings_tree_leaf(
-                "settings-nav:chat",
-                SettingsTab::General,
-                "聊天 · 详略",
-                "全局详略：整轮 → 过程组 → 正文，逐档多展开一层",
-                cx,
-            )));
-            body = body.child(div().pl(px(22.)).child(self.settings_tree_leaf(
-                "settings-nav:models",
-                SettingsTab::Models,
-                "模型",
-                "provider 与模型；添加网关或自定模型",
-                cx,
-            )));
-        }
-        body = body.child(self.settings_tree_group("sessions", "会话", cx));
-        if sessions_open {
-            body = body.child(div().pl(px(22.)).child(self.settings_tree_leaf(
-                "settings-nav:archive",
-                SettingsTab::Archive,
-                "归档",
-                "可恢复，或从本机移除",
-                cx,
-            )));
-        }
-        body
+            .child(div().mt(px(8.)).child(tabs.flex().flex_col().w_full()))
     }
 
-    /// 设置树的一个分组行：点它折叠/展开子项，不切换主区。
-    fn settings_tree_group(
-        &self,
-        key: &'static str,
-        label: &'static str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let open = self.settings_tree.get(key).copied().unwrap_or(true);
-        let arrow = if open {
-            IconName::ChevronDown
-        } else {
-            IconName::ChevronRight
-        };
-        let toggle = cx.entity();
+    /// 分组标题：小字、弱墨、不可点。`first` 只用来决定要不要留上间距。
+    fn settings_nav_section(&self, label: &'static str, first: bool) -> impl IntoElement {
         div()
-            .id(ElementId::Name(format!("settings-tree:{key}").into()))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .mt(px(6.))
+            .when(!first, |this| this.mt(px(14.)))
             .px(px(8.))
             .py(px(6.))
-            .rounded(px(6.))
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(theme::BG_HOVER)))
-            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                toggle.update(cx, |chat, cx| {
-                    let next = !chat.settings_tree.get(key).copied().unwrap_or(true);
-                    chat.settings_tree.insert(key.to_owned(), next);
-                    cx.notify();
-                });
-            })
-            .child(icon(arrow, 12.0, theme::INK_MUTED))
-            .child(
-                div()
-                    .text_size(px(theme::UI))
-                    .text_color(rgb(theme::INK_SOFT))
-                    .child(label),
-            )
+            .text_size(px(theme::META))
+            .text_color(rgb(theme::INK_MUTED))
+            .child(label)
     }
 
-    /// 设置树的一个叶子行：选中它切换主区页面；副标题只在该叶子选中时显示。
-    fn settings_tree_leaf(
-        &self,
-        id: &'static str,
-        tab: SettingsTab,
-        label: &'static str,
-        note: &'static str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    /// 一个导航条目：图标 + 标签，选中给底色与一级墨色。
+    fn settings_nav_tab(&self, tab: SettingsTab, cx: &mut Context<Self>) -> impl IntoElement {
         let select = cx.entity();
         let selected = self.settings_tab == tab;
-        let mut row = div()
-            .id(ElementId::Name(id.into()))
-            .flex()
-            .flex_col()
-            .gap_1()
-            .px(px(8.))
-            .py(px(6.))
-            .rounded(px(6.))
-            .bg(rgb(if selected {
-                theme::BG_HOVER
-            } else {
-                theme::BG_SIDEBAR
-            }))
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(theme::BG_HOVER)))
-            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                select.update(cx, |chat, cx| {
+        Tab::new(ElementId::Name(
+            format!("settings-nav:{}", tab.key()).into(),
+        ))
+        .selected(selected)
+        .accessibility_label(tab.label())
+        .on_click(move |_, _, cx| {
+            select.update(cx, |chat, cx| {
+                if chat.settings_tab != tab {
                     chat.settings_tab = tab;
                     cx.notify();
-                });
-            })
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .w(px(6.))
-                            .h(px(6.))
-                            .rounded_full()
-                            .bg(rgb(if selected {
-                                theme::INK
-                            } else {
-                                theme::INK_MUTED
-                            })),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(theme::UI))
-                            .text_color(rgb(if selected {
-                                theme::INK
-                            } else {
-                                theme::INK_SOFT
-                            }))
-                            .child(label),
-                    ),
-            );
-        if selected {
-            row = row.child(
-                div()
-                    .text_size(px(theme::META))
-                    .text_color(rgb(theme::INK_MUTED))
-                    .child(note),
-            );
-        }
-        row
+                }
+            });
+        })
+        .flex()
+        .flex_row()
+        .justify_start()
+        .gap_2()
+        .px(px(8.))
+        .py(px(6.))
+        .rounded(px(6.))
+        .text_size(px(theme::UI))
+        .bg(rgb(if selected {
+            theme::BG_ACTIVE
+        } else {
+            theme::BG_SIDEBAR
+        }))
+        .text_color(rgb(if selected {
+            theme::INK
+        } else {
+            theme::INK_SOFT
+        }))
+        .hover(|style| style.bg(rgb(theme::BG_HOVER)))
+        .cursor_pointer()
+        .child(icon(
+            tab.icon(),
+            14.0,
+            if selected {
+                theme::INK
+            } else {
+                theme::INK_MUTED
+            },
+        ))
+        .child(div().child(tab.label()))
     }
 
     fn side_top(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2021,57 +2022,8 @@ impl Chat {
             )
     }
 
-    /// 最小 settings 页面：一个设置、三档取值，不摆未来项占位。
+    /// 「通用 → 常规」页：对话详略一个四档滑块。
     fn settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut segments = div().flex().flex_row().flex_1().gap_1();
-        for verbosity in ChatVerbosity::ALL {
-            let entity = cx.entity();
-            let sender = self.commands.clone();
-            let previous = self.settings.verbosity;
-            let selected = self.settings.verbosity == verbosity;
-            segments = segments.child(
-                div()
-                    .id(ElementId::Name(
-                        format!("verbosity:{}", verbosity.key()).into(),
-                    ))
-                    .flex()
-                    .flex_1()
-                    .justify_center()
-                    .items_center()
-                    .py(px(8.))
-                    .rounded(px(6.))
-                    .bg(rgb(if selected {
-                        theme::BG_HOVER
-                    } else {
-                        theme::BG_CARD
-                    }))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(theme::BG_HOVER)))
-                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                        let _ = sender.try_send(UiCommand::SetChatVerbosity {
-                            verbosity,
-                            previous,
-                        });
-                        entity.update(cx, |chat, cx| {
-                            chat.apply_verbosity(verbosity);
-                            chat.settings_error = None;
-                            chat.settings_saved = false;
-                            cx.notify();
-                        });
-                    })
-                    .child(
-                        div()
-                            .text_size(px(theme::UI))
-                            .text_color(rgb(if selected {
-                                theme::INK
-                            } else {
-                                theme::INK_SOFT
-                            }))
-                            .child(verbosity.label()),
-                    ),
-            );
-        }
-
         div()
             .flex()
             .flex_col()
@@ -2101,7 +2053,7 @@ impl Chat {
                                 div()
                                     .text_size(px(theme::BODY))
                                     .text_color(rgb(theme::INK))
-                                    .child("聊天"),
+                                    .child("对话"),
                             )
                             .child(
                                 div()
@@ -2114,18 +2066,20 @@ impl Chat {
                         div()
                             .flex()
                             .flex_col()
-                            .p(px(4.))
+                            .gap_3()
+                            .p(px(14.))
                             .rounded(px(10.))
                             .bg(rgb(theme::BG_CARD))
                             .border_1()
                             .border_color(rgb(theme::BG_CARD_EDGE))
-                            .child(segments),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(theme::META))
-                            .text_color(rgb(theme::INK_SOFT))
-                            .child(self.settings.verbosity.description()),
+                            .child(self.verbosity_slider(cx))
+                            .child(self.verbosity_scale())
+                            .child(
+                                div()
+                                    .text_size(px(theme::META))
+                                    .text_color(rgb(theme::INK_SOFT))
+                                    .child(self.settings.verbosity.description()),
+                            ),
                     )
                     .child(
                         div()
@@ -2149,6 +2103,76 @@ impl Chat {
                         div().into_any_element()
                     }),
             )
+    }
+
+    /// 详略滑块本体。
+    ///
+    /// `gpui-base` 的滑块是无样式的：`Slider` 只管交互，轨道 / 填充 / 拇指由
+    /// 调用方画。三条约定必须同时成立，否则拖不动或松手不写：
+    ///
+    /// 1. 拇指是 `Slider` 的子元素——松手（`Release`）由 `Slider` 上的 mouse-up
+    ///    监听发出，拇指放在 `Slider` 之外就收不到，`dragging` 会一直挂着。
+    /// 2. `SliderIndicator` 必须是横跨整条轨道的那个元素：它把自己的 bounds 记进
+    ///    状态，值↔位置的换算全靠这份宽度；填充条只能是它的子元素。
+    /// 3. 左右各留 7px（拇指半径），两端拇指才不越出可视区。
+    fn verbosity_slider(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = &self.verbosity_slider;
+        let fraction = state.read(cx).percentage().end;
+        div().relative().w_full().h(px(22.)).px(px(7.)).child(
+            Slider::new(state)
+                .size_full()
+                .child(
+                    SliderTrack::new(state).size_full().child(
+                        SliderIndicator::new(state)
+                            .relative()
+                            .mt(px(9.))
+                            .w_full()
+                            .h(px(4.))
+                            .rounded_full()
+                            .bg(rgb(theme::BG_CARD_EDGE))
+                            .child(
+                                div()
+                                    .h_full()
+                                    .rounded_full()
+                                    .bg(rgb(theme::INK_SOFT))
+                                    .w(relative(fraction)),
+                            ),
+                    ),
+                )
+                .child(
+                    SliderThumb::new(state)
+                        .absolute()
+                        .top(px(4.))
+                        .left(relative(fraction))
+                        .ml(px(-7.))
+                        .w(px(14.))
+                        .h(px(14.))
+                        .rounded_full()
+                        .bg(rgb(theme::INK))
+                        .border_2()
+                        .border_color(rgb(theme::BG_CARD)),
+                ),
+        )
+    }
+
+    /// 四档刻度标签：当前档用一级墨色，其余压到弱墨。只读，不做点击。
+    fn verbosity_scale(&self) -> impl IntoElement {
+        let mut scale = div().flex().flex_row().w_full().gap_1();
+        for verbosity in ChatVerbosity::ALL {
+            let selected = self.settings.verbosity == verbosity;
+            scale = scale.child(
+                div()
+                    .flex_1()
+                    .text_size(px(theme::META))
+                    .text_color(rgb(if selected {
+                        theme::INK
+                    } else {
+                        theme::INK_MUTED
+                    }))
+                    .child(verbosity.label()),
+            );
+        }
+        scale
     }
 
     /// 模型设置页：可配置 provider 列表 + 添加自定义网关表单。
@@ -2805,8 +2829,28 @@ impl Chat {
 
     /// 应用档位只影响默认值；语义键上的手动覆盖保留，让新档位与用户选择共存。
     /// 真值由 host 回送，这里只更新内存镜像。
+    ///
+    /// 权威值变化时顺手记一次滑块同步：`set_value` 要 `Window`，而这里没有，
+    /// 所以只挂标记，由 `render` 在下一帧推给滑块。
     fn apply_verbosity(&mut self, verbosity: ChatVerbosity) {
         self.settings.verbosity = verbosity;
+        self.verbosity_slider_sync = Some(verbosity);
+    }
+
+    /// 滑块松手：先乐观画上，再把写命令交给 host；失败由回送的旧值回滚。
+    fn commit_verbosity(&mut self, verbosity: ChatVerbosity, cx: &mut Context<Self>) {
+        if verbosity == self.settings.verbosity {
+            return;
+        }
+        let previous = self.settings.verbosity;
+        let _ = self.commands.try_send(UiCommand::SetChatVerbosity {
+            verbosity,
+            previous,
+        });
+        self.settings.verbosity = verbosity;
+        self.settings_error = None;
+        self.settings_saved = false;
+        cx.notify();
     }
 
     // ── 主区 ────────────────────────────────────────────────────────────
@@ -4207,7 +4251,15 @@ impl Chat {
 }
 
 impl Render for Chat {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 权威档位变了（启动读取 / 写回回送 / 写失败回滚）：把滑块拉到同一个值。
+        // `set_value` 要 `Window`，事件处理里拿不到，所以只在渲染时补这一步。
+        if let Some(verbosity) = self.verbosity_slider_sync.take() {
+            let value = verbosity.index() as f32;
+            self.verbosity_slider
+                .update(cx, |state, cx| state.set_value(value, window, cx));
+        }
+
         let mut root = div()
             .flex()
             .flex_row()

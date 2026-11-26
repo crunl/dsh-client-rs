@@ -2558,3 +2558,48 @@ digest + 多块输入、`trusted_command` 白名单/拒绝、`flock` guard_drop/
 
 **无法 headless 验证（如实记录）**：真实 GUI 首次播种时序、macOS 删除运行中可执行文件后
 host 仍 ready、真多进程 flock 竞争——需真机补验。
+
+## #63 设置侧栏改为一层平铺 tab + 分组小标题，详略改滑块
+
+**日期**：2026-11
+
+**决策**：设置侧栏去掉可折叠的分组树，改成对齐官方的「不可点小标题 + 组内条目」：
+
+```
+通用
+  常规     ← 对话详略（4 档滑块）
+  模型     ← provider / 模型设置
+数据
+  归档     ← 归档会话（恢复 / 从本机移除）
+```
+
+组标题只是小字弱墨的静态文字，不带箭头、不接点击。条目用 `gpui-base` 的
+`Tabs` / `Tab`（`Axis::Vertical`），拿到 ARIA tabs 语义与方向键漫游焦点。
+「常规」页的四档从分段按钮换成 `gpui-base` 的 `Slider` + `SliderState`
+（`min 0 / max 3 / step 1`）。
+
+**为什么**：三个条目分两层折叠是纯负担——默认全展开，折叠一次只省下两行，
+却要引入一份只用两个 key 的展开状态表。原结构里「偏好 → 聊天 · 详略」的措辞
+也把「分组名」和「条目名」混着用，读起来像两个概念叠在一起。改成官方那种
+小节标题 + 条目后，分组仍然存在（语义需要），但不再是一个可交互、可丢失的
+状态。滑块则比四个等宽按钮更适合「一维有序的四档」，且步进天然离散，
+拖到哪档就是哪档。
+
+**行为**：
+
+- 复用 `gpui-base`，不开 `component` feature（DECISIONS #20 的内存结论不变）。
+  `Slider` / `Tabs` 都是无样式原语，轨道、填充、拇指、选中底色全部按 `theme`
+  自绘，视觉仍是 fx-ui 那一套（#7）。
+- 滑块只在 `SliderEvent::Release` 时写 host（`UiCommand::SetChatVerbosity`），
+  拖动途中的 `Change` 只重画；写失败照旧回滚到 `previous`。
+- 权威值（启动读取 / 写回回送 / 失败回滚）变化时，通过一个待同步标记在
+  `Chat::render` 里推给滑块——`SliderState::set_value` 需要 `Window`，事件处理
+  里拿不到，只能在渲染期补这一步。
+- 图标仍只用默认资源包里内嵌的 Lucide 名字（#22）：`Settings2` / `Cpu` / `Inbox`。
+
+**验证**：`cargo fmt --all -- --check`、`cargo clippy -p dsh-client-ui --all-targets
+-- -D warnings`、`cargo test -p dsh-client-ui`（39 passed）通过。新增单测
+`slider_index_round_trips_every_layer`：档位与滑块序号一一对应、越界夹到两端。
+
+**无法 headless 验证（如实记录）**：滑块拖动手感、拇指与填充条的实际像素对齐、
+Tabs 的方向键漫游与焦点环——都需要真机目视确认。

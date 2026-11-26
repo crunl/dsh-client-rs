@@ -27,6 +27,26 @@ impl ChatVerbosity {
     /// 所有可选项，settings 页面按这个顺序画。
     pub const ALL: [Self; 4] = [Self::Low, Self::Medium, Self::High, Self::Full];
 
+    /// 在 [`Self::ALL`] 里的下标；滑块只认这个序号，不认文案。
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Low => 0,
+            Self::Medium => 1,
+            Self::High => 2,
+            Self::Full => 3,
+        }
+    }
+
+    /// 序号的逆运算；越界时夹到两端（滑块拖动只会给合法序号，这里是兜底）。
+    pub const fn from_index(index: usize) -> Self {
+        match index {
+            0 => Self::Low,
+            1 => Self::Medium,
+            2 => Self::High,
+            _ => Self::Full,
+        }
+    }
+
     /// native UI 的稳定键，只用于控件 id 与调试覆盖。
     pub const fn key(self) -> &'static str {
         match self {
@@ -169,5 +189,15 @@ mod tests {
     #[test]
     fn default_is_medium() {
         assert_eq!(ChatVerbosity::default(), ChatVerbosity::Medium);
+    }
+
+    #[test]
+    fn slider_index_round_trips_every_layer() {
+        // 滑块只传序号：序号与档位必须一一对应，且越界夹到两端。
+        for (index, verbosity) in ChatVerbosity::ALL.into_iter().enumerate() {
+            assert_eq!(verbosity.index(), index);
+            assert_eq!(ChatVerbosity::from_index(index), verbosity);
+        }
+        assert_eq!(ChatVerbosity::from_index(9), ChatVerbosity::Full);
     }
 }
